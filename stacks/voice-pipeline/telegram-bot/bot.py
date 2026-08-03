@@ -34,6 +34,7 @@ DB_SCHEMA = os.getenv("DB_SCHEMA", "tractor")
 SCHEMA_TABLES = [t.strip() for t in os.getenv("SCHEMA_TABLES", "").split(",") if t.strip()]
 NUM_CTX = int(os.getenv("NUM_CTX", "16384"))  # ollama context window per request
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))  # cold model load can take minutes on CPU
 
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
 TELEGRAM_MSG_LIMIT = 4096
@@ -200,7 +201,7 @@ async def query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, 
     """Orchestrates routing -> LLM -> SQL (with self-correction) -> LLM.
     Returns (reply, last_executed_sql or None)."""
     headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
         tables = list(schema_map)
         if len(tables) > ROUTING_MIN_TABLES:
             try:
@@ -443,9 +444,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text((echo + (reply or "No response generated."))[:TELEGRAM_MSG_LIMIT])
 
     except Exception as e:
-        logger.error(f"Handler Error: {e}")
+        logger.exception("Handler Error")
         if DEBUG_MODE:
-            await status.edit_text(f"⚠️ DEBUG ERROR: {str(e)}"[:TELEGRAM_MSG_LIMIT])
+            # repr(): timeouts and friends often have an empty str()
+            await status.edit_text(f"⚠️ DEBUG ERROR: {e!r}"[:TELEGRAM_MSG_LIMIT])
         else:
             await status.edit_text("An error occurred while processing your query.")
     finally:
