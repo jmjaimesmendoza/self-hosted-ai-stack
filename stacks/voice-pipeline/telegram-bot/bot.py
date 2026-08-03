@@ -58,6 +58,7 @@ MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
 TELEGRAM_MSG_LIMIT = 4096
 MAX_SQL_ATTEMPTS = 3     # self-correction: model sees SQL errors and retries
 ROUTING_MIN_TABLES = 15  # skip stage-1 table routing for schemas this small
+HISTORY_MAX = 10         # messages kept per user (5 exchanges) for follow-up questions
 LANGUAGES = {"ES": "Spanish", "EN": "English", "PT": "Portuguese"}
 
 hasher = PasswordHasher()
@@ -209,7 +210,7 @@ CLAUDE_SQL_TOOL = {
 }
 
 async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str,
-                                locale: str, scope: str = "") -> tuple:
+                                locale: str, scope: str = "", history: list = None) -> tuple:
     """SQL generation via the Claude API. Returns (reply, last_executed_sql or None)."""
     schema = "\n".join(schema_map.values())
     # Static block (identical across users/turns) is prompt-cached; the
@@ -224,6 +225,8 @@ All ids are UUIDs — NEVER guess an id from a name. When the user mentions a fa
 herd, animal, or person by name, match it with a join and ILIKE (e.g.
 JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
 Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
+If the question is ambiguous or missing information you need (which farm, which period,
+which animals), ask a short clarifying question instead of guessing.
 {FEW_SHOTS}"""
     dynamic_text = (f"The current user's organization_id is '{org_id}'.{scope}\n"
                     f"Always answer the user in {LANGUAGES.get(locale, 'English')}.")
@@ -232,7 +235,7 @@ Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destr
         {"type": "text", "text": dynamic_text},
     ]
 
-    messages = [{"role": "user", "content": user_prompt}]
+    messages = (history or []) + [{"role": "user", "content": user_prompt}]
     executed_sql = None
     sql_runs = 0
     while True:
@@ -245,7 +248,16 @@ Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destr
         )
         if sql_runs >= MAX_SQL_ATTEMPTS:
             kwargs["tool_choice"] = {"type": "none"}  # force a final answer
-        response = await anthropic_client.messages.create(**kwargs)
+        for retry in range(3):
+            try:
+                response = await anthropic_client.messages.create(**kwargs)
+                break
+            except json.JSONDecodeError:
+                # ponytail: Moonshot's endpoint sometimes returns 200 with an empty
+                # body on slow requests — the SDK won't retry a "successful" status
+                logger.warning(f"Non-JSON body from LLM API, retrying ({retry + 1}/3)")
+        else:
+            return "The AI service returned an empty response — please try again.", executed_sql
 
         if response.stop_reason == "refusal":
             logger.warning("Claude declined the request (stop_reason=refusal)")
@@ -283,13 +295,15 @@ async def pick_tables(client, headers, question: str, table_names: list) -> list
     # match known names in the reply — no fragile JSON parsing of a small model
     return [t for t in table_names if re.search(rf"\b{re.escape(t)}\b", text)]
 
-async def query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str, scope: str = "") -> tuple:
+async def query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str,
+                         scope: str = "", history: list = None) -> tuple:
     """Dispatch to the Claude API when a key is configured, else local LiteLLM."""
     if anthropic_client:
-        return await claude_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope)
-    return await litellm_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope)
+        return await claude_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history)
+    return await litellm_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history)
 
-async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str, scope: str = "") -> tuple:
+async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str,
+                                 scope: str = "", history: list = None) -> tuple:
     """Orchestrates routing -> LLM -> SQL (with self-correction) -> LLM.
     Returns (reply, last_executed_sql or None)."""
     headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"}
@@ -319,10 +333,15 @@ All ids are UUIDs — NEVER guess an id from a name. When the user mentions a fa
 herd, animal, or person by name, match it with a join and ILIKE (e.g.
 JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
 Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
+If the question is ambiguous or missing information you need (which farm, which period,
+which animals), ask a short clarifying question instead of guessing.
 Always answer the user in {LANGUAGES.get(locale, "English")}.
 {FEW_SHOTS}{" /no_think" if NO_THINK else ""}"""
 
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        # ponytail: table routing above only sees the current question, not history —
+        # feed the last user turn into pick_tables if follow-ups route to wrong tables
+        messages = ([{"role": "system", "content": system_prompt}] + (history or [])
+                    + [{"role": "user", "content": user_prompt}])
         executed_sql = None
 
         for attempt in range(MAX_SQL_ATTEMPTS):
@@ -404,6 +423,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     logger.info(f"Login: {email} (tg user {update.effective_user.id})")
 
+    context.user_data.pop("history", None)  # fresh session, fresh conversation
     context.user_data["org_id"] = row["organization_id"]
     context.user_data["db_user_id"] = row["id"]
     context.user_data["name"] = row["name"]
@@ -422,6 +442,10 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Logged in as {d['name']} ({d['email']})\nOrganization: {d['org_id']}\n"
         f"Language: {d.get('locale') or 'ES'}\nScope: {farm} / {herd}"
     )
+
+async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("history", None)
+    await update.message.reply_text("New conversation started — previous questions are forgotten.")
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -504,12 +528,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("🎙 Transcribing…" if is_voice else "🔍 Querying the database…")
 
     try:
-        echo = ""
+        echo, prompt = "", ""
         if is_voice:
             voice_file = await context.bot.get_file(update.message.voice.file_id)
             voice_bytes = await voice_file.download_as_bytearray()
             async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(WHISPER_URL, files={"file": ("voice.ogg", voice_bytes)}, data={"model": "whisper-1"})
+                r = await client.post(WHISPER_URL, files={"file": ("voice.ogg", bytes(voice_bytes))}, data={"model": "whisper-1"})
                 r.raise_for_status()
                 prompt = r.json().get("text", "").strip()
             if not prompt:
@@ -532,18 +556,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if DEBUG_MODE:
             await update.effective_message.reply_text(f"🔧 LLM: {LLM_BACKEND} ({LLM_MODEL or 'litellm'})")
         reply, executed_sql = await query_pipeline(prompt, pool, context.bot_data["db_schema"], org_id,
-                                                   context.user_data.get("locale") or "ES", scope)
+                                                   context.user_data.get("locale") or "ES", scope,
+                                                   context.user_data.get("history"))
+        if reply:
+            history = context.user_data.setdefault("history", [])
+            history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": reply}]
+            del history[:-HISTORY_MAX]
         if DEBUG_MODE and executed_sql:
             reply = f"{reply or ''}\n\n🔧 SQL:\n{executed_sql}"
         await status.edit_text((echo + (reply or "No response generated."))[:TELEGRAM_MSG_LIMIT])
 
     except Exception as e:
         logger.exception("Handler Error")
+        # record the failed turn so "try again" or a rephrase keeps its context
+        if prompt:
+            history = context.user_data.setdefault("history", [])
+            history += [{"role": "user", "content": prompt},
+                        {"role": "assistant",
+                         "content": f"(No answer was produced — the request failed with {type(e).__name__}. "
+                                    "The user may retry or rephrase.)"}]
+            del history[:-HISTORY_MAX]
         if DEBUG_MODE:
             # repr(): timeouts and friends often have an empty str()
             await status.edit_text(f"⚠️ DEBUG ERROR: {e!r}"[:TELEGRAM_MSG_LIMIT])
         else:
-            await status.edit_text("An error occurred while processing your query.")
+            await status.edit_text("Something went wrong with that question. "
+                                   "You can say “try again”, rephrase it, or narrow it down.")
     finally:
         context.user_data["busy"] = False
 
@@ -564,6 +602,7 @@ async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("login", "Log in: /login <email> <password>"),
         BotCommand("farm", "Choose the farm/herd your questions are about"),
+        BotCommand("new", "Start a new conversation (forget previous questions)"),
         BotCommand("whoami", "Show who is logged in and current scope"),
         BotCommand("logout", "Log out"),
     ])
@@ -577,6 +616,7 @@ def main():
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("logout", logout))
     app.add_handler(CommandHandler("farm", farm_menu))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(farm|herd):"))
