@@ -44,6 +44,7 @@ DECLARE
   r record;
   fk record;
   cond text;
+  del text;
   policied text[] := ARRAY[]::text[];
   denied text[] := ARRAY[]::text[];
   -- global reference tables: readable by every org, no RLS needed
@@ -83,7 +84,7 @@ BEGIN
 
   -- Pass 1: direct organization_id column
   FOR r IN
-    SELECT c.relname AS tbl FROM pg_class c
+    SELECT c.relname AS tbl, c.oid FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'tractor' AND c.relkind = 'r'
       AND c.relname <> ALL (always_deny)
@@ -91,11 +92,17 @@ BEGIN
                   WHERE a.attrelid = c.oid AND a.attname = 'organization_id'
                     AND a.attnum > 0 AND NOT a.attisdropped)
   LOOP
+    -- soft-deleted rows are invisible to the bot when the column exists
+    del := '';
+    IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = r.oid
+               AND a.attname = 'is_deleted' AND a.attnum > 0 AND NOT a.attisdropped) THEN
+      del := ' AND is_deleted = false';
+    END IF;
     EXECUTE format('ALTER TABLE tractor.%I ENABLE ROW LEVEL SECURITY', r.tbl);
     EXECUTE format('DROP POLICY IF EXISTS bot_org ON tractor.%I', r.tbl);
     EXECUTE format(
       $q$CREATE POLICY bot_org ON tractor.%I FOR SELECT TO speech_sql_user
-         USING (organization_id = current_setting('app.org_id', true))$q$, r.tbl);
+         USING (organization_id = current_setting('app.org_id', true)%s)$q$, r.tbl, del);
     policied := policied || r.tbl;
   END LOOP;
 
@@ -134,12 +141,17 @@ BEGIN
         JOIN pg_attribute ca ON ca.attrelid = fk.conrelid AND ca.attnum = m.c_attnum
         JOIN pg_attribute fa ON fa.attrelid = fk.confrelid AND fa.attnum = m.p_attnum;
 
+        del := '';
+        IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = r.oid
+                   AND a.attname = 'is_deleted' AND a.attnum > 0 AND NOT a.attisdropped) THEN
+          del := ' AND is_deleted = false';
+        END IF;
         EXECUTE format('ALTER TABLE tractor.%I ENABLE ROW LEVEL SECURITY', r.tbl);
         EXECUTE format('DROP POLICY IF EXISTS bot_org ON tractor.%I', r.tbl);
         EXECUTE format(
           'CREATE POLICY bot_org ON tractor.%I FOR SELECT TO speech_sql_user
-           USING (EXISTS (SELECT 1 FROM tractor.%I p WHERE %s))',
-          r.tbl, fk.parent, cond);
+           USING (EXISTS (SELECT 1 FROM tractor.%I p WHERE %s)%s)',
+          r.tbl, fk.parent, cond, del);
         policied := policied || r.tbl;
         progress := true;
       END IF;

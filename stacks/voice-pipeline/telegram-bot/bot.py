@@ -77,8 +77,10 @@ async def org_fetch(pool, org_id: str, query: str, *args):
 
 async def execute_sql(pool, sql_query: str, org_id: str) -> str:
     """Run SQL read-only; RLS (see rls.sql) hides rows outside org_id."""
+    logger.info(f"SQL [{org_id}]: {sql_query}")
     try:
         rows = await org_fetch(pool, org_id, sql_query)
+        logger.info(f"SQL result: {len(rows)} rows")
         result = json.dumps([dict(row) for row in rows], default=str)
         if len(result) > MAX_RESULT_CHARS:
             result = result[:MAX_RESULT_CHARS] + f'"] (truncated, {len(rows)} rows total)'
@@ -87,8 +89,8 @@ async def execute_sql(pool, sql_query: str, org_id: str) -> str:
         logger.error(f"SQL Error: {e}")
         return json.dumps({"error": str(e)})
 
-async def query_pipeline(user_prompt: str, pool, schema: str, org_id: str, locale: str, scope: str = "") -> str:
-    """Orchestrates LLM -> SQL -> LLM."""
+async def query_pipeline(user_prompt: str, pool, schema: str, org_id: str, locale: str, scope: str = "") -> tuple:
+    """Orchestrates LLM -> SQL -> LLM. Returns (reply, executed_sql or None)."""
     system_prompt = f"""You are an AI with access to a PostgreSQL database.
 DATABASE SCHEMA:
 {schema}
@@ -121,7 +123,9 @@ Always answer the user in {LANGUAGES.get(locale, "English")}."""
             # instead of a structured tool_calls entry — salvage the SQL
             m = re.search(r'"sql_query"\s*:\s*("(?:[^"\\]|\\.)*")', content)
             if not m:
-                return content or "No response generated."
+                logger.info("LLM answered without SQL")
+                return content or "No response generated.", None
+            logger.info("Salvaged inline tool call from text response")
             sql_query = json.loads(m.group(1))
             db_result = await execute_sql(pool, sql_query, org_id)
             messages.extend([
@@ -131,7 +135,7 @@ Always answer the user in {LANGUAGES.get(locale, "English")}."""
 
         final_resp = await client.post(LITELLM_URL, json={"model": MODEL_NAME, "messages": messages}, headers=headers)
         final_resp.raise_for_status()
-        return final_resp.json()["choices"][0]["message"]["content"]
+        return final_resp.json()["choices"][0]["message"]["content"], sql_query
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Log in with your account: /login <email> <password>")
@@ -164,8 +168,10 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except VerifyMismatchError:
             pass
     if not verified:
+        logger.warning(f"Failed login attempt for {email} (tg user {update.effective_user.id})")
         await chat.send_message("Invalid credentials.")
         return
+    logger.info(f"Login: {email} (tg user {update.effective_user.id})")
 
     context.user_data["org_id"] = row["organization_id"]
     context.user_data["db_user_id"] = row["id"]
@@ -282,6 +288,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text(f"{echo}🔍 Querying the database…")
         else:
             prompt = update.message.text
+        logger.info(f"Q [{context.user_data.get('email')}{' voice' if is_voice else ''}]: {prompt}")
 
         scope = ""
         farm, herd = context.user_data.get("farm"), context.user_data.get("herd")
@@ -291,8 +298,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if herd:
             scope += (f"\nWithin that farm, herd '{herd['name']}' (herds.id = '{herd['id']}') — "
                       "scope to this herd unless told otherwise.")
-        reply = await query_pipeline(prompt, pool, context.bot_data["db_schema"], org_id,
-                                     context.user_data.get("locale") or "ES", scope)
+        reply, executed_sql = await query_pipeline(prompt, pool, context.bot_data["db_schema"], org_id,
+                                                   context.user_data.get("locale") or "ES", scope)
+        if DEBUG_MODE and executed_sql:
+            reply = f"{reply or ''}\n\n🔧 SQL:\n{executed_sql}"
         await status.edit_text((echo + (reply or "No response generated."))[:TELEGRAM_MSG_LIMIT])
 
     except Exception as e:
