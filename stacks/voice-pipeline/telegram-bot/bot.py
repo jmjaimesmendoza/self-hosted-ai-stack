@@ -30,6 +30,9 @@ LITELLM_URL = os.getenv("LITELLM_URL", "http://litellm:4000/v1/chat/completions"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/postgres")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:14b")
 DB_SCHEMA = os.getenv("DB_SCHEMA", "tractor")
+# comma-separated table allowlist to keep the prompt small; empty = all visible tables
+SCHEMA_TABLES = [t.strip() for t in os.getenv("SCHEMA_TABLES", "").split(",") if t.strip()]
+NUM_CTX = int(os.getenv("NUM_CTX", "16384"))  # ollama context window per request
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
@@ -59,10 +62,11 @@ async def get_db_schema(pool) -> str:
         SELECT table_name, column_name, data_type
         FROM information_schema.columns
         WHERE table_schema = $1
+          AND ($2::text[] IS NULL OR table_name = ANY($2))
         ORDER BY table_name, ordinal_position;
     """
     async with pool.acquire() as conn:
-        rows = await conn.fetch(query, DB_SCHEMA)
+        rows = await conn.fetch(query, DB_SCHEMA, SCHEMA_TABLES or None)
     schema_dict = {}
     for row in rows:
         schema_dict.setdefault(row["table_name"], []).append(f"{row['column_name']} ({row['data_type']})")
@@ -107,7 +111,8 @@ Always answer the user in {LANGUAGES.get(locale, "English")}."""
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        payload = {"model": MODEL_NAME, "messages": messages, "tools": [RUN_SQL_TOOL], "tool_choice": "auto"}
+        payload = {"model": MODEL_NAME, "messages": messages, "tools": [RUN_SQL_TOOL],
+                   "tool_choice": "auto", "num_ctx": NUM_CTX}
         resp = await client.post(LITELLM_URL, json=payload, headers=headers)
         resp.raise_for_status()
         message = resp.json()["choices"][0]["message"]
@@ -133,7 +138,8 @@ Always answer the user in {LANGUAGES.get(locale, "English")}."""
                 {"role": "user", "content": f"Query result: {db_result}\nAnswer the original question using this data."},
             ])
 
-        final_resp = await client.post(LITELLM_URL, json={"model": MODEL_NAME, "messages": messages}, headers=headers)
+        final_resp = await client.post(LITELLM_URL, json={"model": MODEL_NAME, "messages": messages,
+                                                          "num_ctx": NUM_CTX}, headers=headers)
         final_resp.raise_for_status()
         return final_resp.json()["choices"][0]["message"]["content"], sql_query
 
@@ -317,7 +323,10 @@ async def post_init(app):
     """Create the pool inside PTB's event loop, cache the schema, set the command menu."""
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     app.bot_data["db_pool"] = pool
-    app.bot_data["db_schema"] = await get_db_schema(pool)
+    schema = await get_db_schema(pool)
+    app.bot_data["db_schema"] = schema
+    logger.info(f"Schema: {schema.count(chr(10)) + 1} tables, {len(schema)} chars "
+                f"(~{len(schema) // 4} tokens; num_ctx={NUM_CTX})")
     await app.bot.set_my_commands([
         BotCommand("login", "Log in: /login <email> <password>"),
         BotCommand("farm", "Choose the farm/herd your questions are about"),
