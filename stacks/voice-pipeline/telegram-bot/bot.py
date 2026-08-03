@@ -232,13 +232,10 @@ Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destr
             system=system,
             messages=messages,
             tools=[CLAUDE_SQL_TOOL],
-            # policy declines are re-served by Anthropic's recommended fallback model
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
         )
         if sql_runs >= MAX_SQL_ATTEMPTS:
             kwargs["tool_choice"] = {"type": "none"}  # force a final answer
-        response = await anthropic_client.beta.messages.create(**kwargs)
+        response = await anthropic_client.messages.create(**kwargs)
 
         if response.stop_reason == "refusal":
             logger.warning("Claude declined the request (stop_reason=refusal)")
