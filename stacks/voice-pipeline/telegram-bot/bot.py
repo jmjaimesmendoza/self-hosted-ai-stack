@@ -60,6 +60,15 @@ MAX_SQL_ATTEMPTS = 3     # self-correction: model sees SQL errors and retries
 ROUTING_MIN_TABLES = 15  # skip stage-1 table routing for schemas this small
 HISTORY_MAX = 10         # messages kept per user (5 exchanges) for follow-up questions
 LANGUAGES = {"ES": "Spanish", "EN": "English", "PT": "Portuguese"}
+# (query ran, no query ran) — appended to replies so the user knows the turn is over
+FOOTERS = {
+    "ES": ("\n\n✅ Consulta finalizada — puedes hacer otra pregunta o pedir un ajuste.",
+           "\n\n💬 No se consultó la base de datos — responde para continuar."),
+    "EN": ("\n\n✅ Query complete — ask another question or request a tweak.",
+           "\n\n💬 No database query was run — reply to continue."),
+    "PT": ("\n\n✅ Consulta concluída — faça outra pergunta ou peça um ajuste.",
+           "\n\n💬 Nenhuma consulta foi executada — responda para continuar."),
+}
 
 hasher = PasswordHasher()
 
@@ -227,6 +236,8 @@ JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
 Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
 If the question is ambiguous or missing information you need (which farm, which period,
 which animals), ask a short clarifying question instead of guessing.
+Never announce that you are going to look something up or run a query — either run it
+now with the tool, or ask your clarifying question. Your reply ends the turn.
 {FEW_SHOTS}"""
     dynamic_text = (f"The current user's organization_id is '{org_id}'.{scope}\n"
                     f"Always answer the user in {LANGUAGES.get(locale, 'English')}.")
@@ -335,6 +346,8 @@ JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
 Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
 If the question is ambiguous or missing information you need (which farm, which period,
 which animals), ask a short clarifying question instead of guessing.
+Never announce that you are going to look something up or run a query — either run it
+now with the tool, or ask your clarifying question. Your reply ends the turn.
 Always answer the user in {LANGUAGES.get(locale, "English")}.
 {FEW_SHOTS}{" /no_think" if NO_THINK else ""}"""
 
@@ -564,7 +577,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del history[:-HISTORY_MAX]
         if DEBUG_MODE and executed_sql:
             reply = f"{reply or ''}\n\n🔧 SQL:\n{executed_sql}"
-        await status.edit_text((echo + (reply or "No response generated."))[:TELEGRAM_MSG_LIMIT])
+        footer = FOOTERS.get(context.user_data.get("locale") or "ES", FOOTERS["ES"])[0 if executed_sql else 1]
+        await status.edit_text((echo + (reply or "No response generated.") + footer)[:TELEGRAM_MSG_LIMIT])
 
     except Exception as e:
         logger.exception("Handler Error")
