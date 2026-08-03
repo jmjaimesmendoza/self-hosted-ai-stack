@@ -4,11 +4,11 @@
 -- one organization per query, selected via:  set_config('app.org_id', <id>, true)
 -- (bot.py does this inside every read-only transaction).
 --
--- Run as the DB user that owns the tables (the one Prisma migrates with):
---   psql "$ADMIN_DATABASE_URL" -v bot_password='<strong password>' -f rls.sql
--- If speech_sql_user already exists its password is left unchanged (the
--- bot_password value is ignored; pass anything). The role must not own the
--- application tables — table owners bypass RLS.
+-- Plain SQL: run with psql -f, \i, or paste into any SQL client, connected as
+-- the DB user that owns the tables (the one Prisma migrates with).
+-- If speech_sql_user already exists its password is left unchanged; if the
+-- script creates it, it uses the placeholder 'change_me' — set a real one with
+-- ALTER ROLE. The role must not own the application tables — owners bypass RLS.
 --
 -- Idempotent — re-run after every Prisma migration so new tables get policies
 -- (new tables are invisible to the bot until you do; safe by default).
@@ -23,13 +23,20 @@
 -- The backend is unaffected: it connects as the table owner, which bypasses
 -- non-FORCE RLS, and all policies are TO speech_sql_user only.
 
-SELECT format('CREATE ROLE speech_sql_user LOGIN PASSWORD %L', :'bot_password')
-WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'speech_sql_user') \gexec
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'speech_sql_user') THEN
+    EXECUTE format('CREATE ROLE speech_sql_user LOGIN PASSWORD %L', 'change_me');
+    RAISE NOTICE 'created speech_sql_user with placeholder password — run ALTER ROLE speech_sql_user PASSWORD ''...'' to set a real one';
+  END IF;
+END $$;
 
 -- The role may pre-exist: make sure it can't sidestep RLS or DDL its way out
 ALTER ROLE speech_sql_user LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
 
-GRANT USAGE ON SCHEMA public TO speech_sql_user;
+GRANT USAGE ON SCHEMA tractor TO speech_sql_user;
+-- unqualified table names in bot queries resolve to the app schema
+ALTER ROLE speech_sql_user SET search_path = tractor;
 
 DO $$
 DECLARE
@@ -55,21 +62,21 @@ BEGIN
   FOR r IN
     SELECT c.relname AS tbl FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'r'
+    WHERE n.nspname = 'tractor' AND c.relkind = 'r'
   LOOP
     BEGIN
       -- reset to SELECT-only, dropping any write grants from the role's past
-      EXECUTE format('REVOKE ALL ON public.%I FROM speech_sql_user', r.tbl);
-      EXECUTE format('GRANT SELECT ON public.%I TO speech_sql_user', r.tbl);
+      EXECUTE format('REVOKE ALL ON tractor.%I FROM speech_sql_user', r.tbl);
+      EXECUTE format('GRANT SELECT ON tractor.%I TO speech_sql_user', r.tbl);
     EXCEPTION WHEN insufficient_privilege THEN
       RAISE NOTICE 'skipped grant on % (not owner)', r.tbl;
     END;
   END LOOP;
 
   -- organizations has no organization_id column: its own id is the org
-  EXECUTE 'ALTER TABLE public.organizations ENABLE ROW LEVEL SECURITY';
-  EXECUTE 'DROP POLICY IF EXISTS bot_org ON public.organizations';
-  EXECUTE $q$CREATE POLICY bot_org ON public.organizations FOR SELECT TO speech_sql_user
+  EXECUTE 'ALTER TABLE tractor.organizations ENABLE ROW LEVEL SECURITY';
+  EXECUTE 'DROP POLICY IF EXISTS bot_org ON tractor.organizations';
+  EXECUTE $q$CREATE POLICY bot_org ON tractor.organizations FOR SELECT TO speech_sql_user
              USING (id = current_setting('app.org_id', true))$q$;
   policied := array_append(policied, 'organizations');
 
@@ -77,16 +84,16 @@ BEGIN
   FOR r IN
     SELECT c.relname AS tbl FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'r'
+    WHERE n.nspname = 'tractor' AND c.relkind = 'r'
       AND c.relname <> ALL (always_deny)
       AND EXISTS (SELECT 1 FROM pg_attribute a
                   WHERE a.attrelid = c.oid AND a.attname = 'organization_id'
                     AND a.attnum > 0 AND NOT a.attisdropped)
   LOOP
-    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', r.tbl);
-    EXECUTE format('DROP POLICY IF EXISTS bot_org ON public.%I', r.tbl);
+    EXECUTE format('ALTER TABLE tractor.%I ENABLE ROW LEVEL SECURITY', r.tbl);
+    EXECUTE format('DROP POLICY IF EXISTS bot_org ON tractor.%I', r.tbl);
     EXECUTE format(
-      $q$CREATE POLICY bot_org ON public.%I FOR SELECT TO speech_sql_user
+      $q$CREATE POLICY bot_org ON tractor.%I FOR SELECT TO speech_sql_user
          USING (organization_id = current_setting('app.org_id', true))$q$, r.tbl);
     policied := policied || r.tbl;
   END LOOP;
@@ -97,7 +104,7 @@ BEGIN
     FOR r IN
       SELECT c.relname AS tbl, c.oid FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = 'public' AND c.relkind = 'r'
+      WHERE n.nspname = 'tractor' AND c.relkind = 'r'
         AND c.relname <> ALL (policied)
         AND c.relname <> ALL (allowed_global)
         AND c.relname <> ALL (always_deny)
@@ -126,11 +133,11 @@ BEGIN
         JOIN pg_attribute ca ON ca.attrelid = fk.conrelid AND ca.attnum = m.c_attnum
         JOIN pg_attribute fa ON fa.attrelid = fk.confrelid AND fa.attnum = m.p_attnum;
 
-        EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', r.tbl);
-        EXECUTE format('DROP POLICY IF EXISTS bot_org ON public.%I', r.tbl);
+        EXECUTE format('ALTER TABLE tractor.%I ENABLE ROW LEVEL SECURITY', r.tbl);
+        EXECUTE format('DROP POLICY IF EXISTS bot_org ON tractor.%I', r.tbl);
         EXECUTE format(
-          'CREATE POLICY bot_org ON public.%I FOR SELECT TO speech_sql_user
-           USING (EXISTS (SELECT 1 FROM public.%I p WHERE %s))',
+          'CREATE POLICY bot_org ON tractor.%I FOR SELECT TO speech_sql_user
+           USING (EXISTS (SELECT 1 FROM tractor.%I p WHERE %s))',
           r.tbl, fk.parent, cond);
         policied := policied || r.tbl;
         progress := true;
@@ -143,12 +150,12 @@ BEGIN
   FOR r IN
     SELECT c.relname AS tbl FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'r'
+    WHERE n.nspname = 'tractor' AND c.relkind = 'r'
       AND c.relname <> ALL (policied)
       AND c.relname <> ALL (allowed_global)
   LOOP
     BEGIN
-      EXECUTE format('REVOKE SELECT ON public.%I FROM speech_sql_user', r.tbl);
+      EXECUTE format('REVOKE SELECT ON tractor.%I FROM speech_sql_user', r.tbl);
       denied := denied || r.tbl;
     EXCEPTION WHEN OTHERS THEN NULL;
     END;
@@ -161,19 +168,19 @@ END $$;
 -- The bot must never see password hashes or reset tokens: replace the
 -- table-level grant on users with a column grant. (SELECT * on users will
 -- fail for the bot; per-column selects work.)
-REVOKE SELECT ON public.users FROM speech_sql_user;
+REVOKE SELECT ON tractor.users FROM speech_sql_user;
 GRANT SELECT (id, name, email, organization_id, profile_id, locale,
               is_super_admin, created_at, updated_at, is_deleted)
-  ON public.users TO speech_sql_user;
+  ON tractor.users TO speech_sql_user;
 
 -- Login runs before an org is known, so it can't go through RLS: a
 -- SECURITY DEFINER function returns exactly the one row login needs.
 -- locale is resolved here: user override, else the org default.
-DROP FUNCTION IF EXISTS public.bot_login(text);
-CREATE FUNCTION public.bot_login(p_email text)
+DROP FUNCTION IF EXISTS tractor.bot_login(text);
+CREATE FUNCTION tractor.bot_login(p_email text)
 RETURNS TABLE (id text, name text, password text, organization_id text, locale text)
 LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = public
+SET search_path = tractor
 AS $fn$
   SELECT u.id, u.name, u.password, u.organization_id,
          COALESCE(u.locale, o.locale)::text
@@ -182,5 +189,5 @@ AS $fn$
   WHERE u.email = p_email AND u.is_deleted = false AND o.is_active = true
 $fn$;
 
-REVOKE ALL ON FUNCTION public.bot_login(text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.bot_login(text) TO speech_sql_user;
+REVOKE ALL ON FUNCTION tractor.bot_login(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION tractor.bot_login(text) TO speech_sql_user;

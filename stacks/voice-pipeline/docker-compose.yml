@@ -106,6 +106,7 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - MODEL_NAME=${MODEL_NAME:-qwen2.5-coder:14b}
       - DEBUG_MODE=${DEBUG_MODE:-false}
+      - DB_SCHEMA=${DB_SCHEMA:-tractor}
     depends_on:
       litellm:
         condition: service_healthy

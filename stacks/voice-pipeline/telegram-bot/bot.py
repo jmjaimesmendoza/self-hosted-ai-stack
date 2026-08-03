@@ -27,6 +27,7 @@ WHISPER_URL = os.getenv("WHISPER_URL", "http://whisper:9000/v1/audio/transcripti
 LITELLM_URL = os.getenv("LITELLM_URL", "http://litellm:4000/v1/chat/completions")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/postgres")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:14b")
+DB_SCHEMA = os.getenv("DB_SCHEMA", "tractor")
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
@@ -55,11 +56,11 @@ async def get_db_schema(pool) -> str:
     query = """
         SELECT table_name, column_name, data_type
         FROM information_schema.columns
-        WHERE table_schema = 'public'
+        WHERE table_schema = $1
         ORDER BY table_name, ordinal_position;
     """
     async with pool.acquire() as conn:
-        rows = await conn.fetch(query)
+        rows = await conn.fetch(query, DB_SCHEMA)
     schema_dict = {}
     for row in rows:
         schema_dict.setdefault(row["table_name"], []).append(f"{row['column_name']} ({row['data_type']})")
