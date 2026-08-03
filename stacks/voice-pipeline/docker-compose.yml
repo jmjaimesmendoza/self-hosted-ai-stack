@@ -111,6 +111,8 @@ services:
       - DB_SCHEMA=${DB_SCHEMA:-tractor}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-opus-5}
+      - KIMI_API_KEY=${KIMI_API_KEY:-}
+      - KIMI_MODEL=${KIMI_MODEL:-kimi-k3}
       - SCHEMA_TABLES=${SCHEMA_TABLES:-}
       - NUM_CTX=${NUM_CTX:-16384}
     depends_on:

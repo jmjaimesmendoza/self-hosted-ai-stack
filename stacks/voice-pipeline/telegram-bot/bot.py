@@ -42,7 +42,16 @@ NO_THINK = os.getenv("NO_THINK", "true").lower() == "true"
 # Claude API path: enabled when a key is present; otherwise the LiteLLM path runs
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5")
-anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+# Kimi K3 via Moonshot's Anthropic-compatible endpoint — same pipeline, different base_url
+KIMI_API_KEY = os.getenv("KIMI_API_KEY", "")
+KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-k3")
+KIMI_BASE_URL = os.getenv("KIMI_BASE_URL", "https://api.moonshot.ai/anthropic")
+if ANTHROPIC_API_KEY:
+    anthropic_client, LLM_MODEL = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY), ANTHROPIC_MODEL
+elif KIMI_API_KEY:
+    anthropic_client, LLM_MODEL = anthropic.AsyncAnthropic(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL), KIMI_MODEL
+else:
+    anthropic_client, LLM_MODEL = None, None
 
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
 TELEGRAM_MSG_LIMIT = 4096
@@ -227,7 +236,7 @@ Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destr
     sql_runs = 0
     while True:
         kwargs = dict(
-            model=ANTHROPIC_MODEL,
+            model=LLM_MODEL,
             max_tokens=MAX_TOKENS,
             system=system,
             messages=messages,
@@ -543,7 +552,8 @@ async def post_init(app):
     app.bot_data["db_schema"] = schema_map
     total = sum(len(v) for v in schema_map.values())
     if anthropic_client:
-        provider = f"Claude API ({ANTHROPIC_MODEL})"
+        name = "Claude API" if ANTHROPIC_API_KEY else "Kimi (Anthropic-compatible)"
+        provider = f"{name} ({LLM_MODEL})"
     else:
         provider = f"LiteLLM ({MODEL_NAME}; num_ctx={NUM_CTX}; " \
                    f"routing {'on' if len(schema_map) > ROUTING_MIN_TABLES else 'off'})"
