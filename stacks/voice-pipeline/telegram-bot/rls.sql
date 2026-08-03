@@ -193,9 +193,3 @@ $fn$;
 REVOKE ALL ON FUNCTION tractor.bot_login(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION tractor.bot_login(text) TO speech_sql_user;
 
-
-
- sk-KjNOnqfJvHrwvqw4-fz-8w
-
-
-curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-KjNOnqfJvHrwvqw4-fz-8w" | jq -r '.data[].id'
