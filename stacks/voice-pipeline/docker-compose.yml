@@ -96,6 +96,20 @@ services:
       - kokoro-data:/var/lib/kokoro
       # - ./kokoro.env:/kokoro.env:ro  # optional: custom config
 
+  telegram-bot:
+    build: ./telegram-bot
+    container_name: telegram-bot
+    restart: always
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - DATABASE_URL=${DATABASE_URL}
+      - MODEL_NAME=${MODEL_NAME:-qwen2.5-coder:14b}
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+    depends_on:
+      litellm:
+        condition: service_healthy
+
   # whisper-live:
   #   image: hwdsl2/whisper-live-server
   #   container_name: whisper-live

@@ -56,7 +56,7 @@ expected_services_for_variant() {
       echo "ai-stack-init db embeddings litellm mcp ollama"
       ;;
     voice-pipeline)
-      echo "ai-stack-init db kokoro litellm ollama whisper"
+      echo "ai-stack-init db kokoro litellm ollama telegram-bot whisper"
       ;;
     voice-chat)
       echo "ai-stack-init anythingllm db kokoro litellm ollama whisper"
