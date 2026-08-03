@@ -37,9 +37,97 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
 TELEGRAM_MSG_LIMIT = 4096
+MAX_SQL_ATTEMPTS = 3     # self-correction: model sees SQL errors and retries
+ROUTING_MIN_TABLES = 15  # skip stage-1 table routing for schemas this small
 LANGUAGES = {"ES": "Spanish", "EN": "English", "PT": "Portuguese"}
 
 hasher = PasswordHasher()
+
+# Known-good question -> SQL pairs; :farmId/:herdId are placeholders the model
+# must replace with the scoped UUIDs (or drop/replace joins when unscoped).
+FEW_SHOTS = """
+EXAMPLE QUERIES — follow these patterns. Replace :farmId and :herdId with the
+selected farm/herd UUIDs from context; if no herd is selected drop the lots
+join; if no farm is selected join farms and match by name with ILIKE.
+Note: "ageGroup" is camelCase and must be double-quoted; enum values are
+uppercase (sex: MALE/FEMALE; ageGroup: CALF/YEARLING/HEIFER/STEER/COW/BULL).
+
+-- ¿Cuál es la búfala más vieja?
+SELECT a.physical_id, a.name, a.birth_date,
+       DATE_PART('year', AGE(a.birth_date)) AS edad_anios
+FROM animals a
+JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
+WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
+  AND a.sex = 'FEMALE' AND a."ageGroup" = 'COW' AND a.birth_date IS NOT NULL
+ORDER BY a.birth_date ASC LIMIT 1;
+
+-- ¿Cuántas búfalas preñadas y vacías hay? (último examen por animal; sin examen = sin chequeo)
+SELECT COUNT(*) FILTER (WHERE ex.result = 'PREGNANT')          AS prenadas,
+       COUNT(*) FILTER (WHERE ex.result = 'NOT_PREGNANT')      AS vacias,
+       COUNT(*) FILTER (WHERE ex.result = 'POSSIBLY_PREGNANT') AS posiblemente_prenadas,
+       COUNT(*) FILTER (WHERE ex.result IS NULL)               AS sin_chequeo
+FROM animals a
+JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
+LEFT JOIN LATERAL (
+  SELECT ge.result FROM gynecological_exams ge
+  WHERE ge.animal_id = a.id AND ge.is_deleted = false
+  ORDER BY ge.date DESC LIMIT 1
+) ex ON true
+WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
+  AND a.sex = 'FEMALE' AND a."ageGroup" IN ('COW', 'HEIFER');
+
+-- ¿Cuántos bautes (machos) y bautas (hembras) hay? (añojos = YEARLING)
+SELECT COUNT(*) FILTER (WHERE a.sex = 'MALE')   AS bautes,
+       COUNT(*) FILTER (WHERE a.sex = 'FEMALE') AS bautas
+FROM animals a
+JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
+WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
+  AND a."ageGroup" = 'YEARLING';
+
+-- ¿Cuántas búfalas secas y en ordeño? (en ordeño = lactancia abierta: inicio sin fin)
+SELECT COUNT(*) FILTER (WHERE ol.animal_id IS NOT NULL) AS en_ordeno,
+       COUNT(*) FILTER (WHERE ol.animal_id IS NULL)     AS secas
+FROM animals a
+JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
+LEFT JOIN (
+  SELECT DISTINCT ls.animal_id
+  FROM lactation_start_events ls
+  LEFT JOIN lactation_end_events le
+    ON le.animal_id = ls.animal_id AND le.birth_event_id = ls.birth_event_id
+   AND le.is_deleted = false
+  WHERE ls.is_deleted = false AND le.animal_id IS NULL
+) ol ON ol.animal_id = a.id
+WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
+  AND a.sex = 'FEMALE' AND a."ageGroup" = 'COW';
+
+-- ¿Cuántas novillas hay?
+SELECT COUNT(*)
+FROM animals a
+JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
+WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
+  AND a.sex = 'FEMALE' AND a."ageGroup" = 'HEIFER';
+
+-- ¿Cuál es el peso promedio de los bautes? (último pesaje por animal)
+SELECT ROUND(AVG(lw.weight), 1) AS peso_promedio_kg,
+       COUNT(*)                 AS animales_pesados
+FROM animals a
+JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
+JOIN LATERAL (
+  SELECT we.weight FROM weigh_in_events we
+  WHERE we.animal_id = a.id AND we.is_deleted = false
+  ORDER BY we.date DESC LIMIT 1
+) lw ON true
+WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
+  AND a.sex = 'MALE' AND a."ageGroup" = 'YEARLING';
+
+-- ¿Cuántos destetes en los últimos 6 meses?
+SELECT COUNT(*)
+FROM weigh_in_events we
+JOIN animals a ON a.id = we.animal_id AND a.farm_id = :farmId AND a.is_deleted = false
+JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
+WHERE we.type = 'WEANING' AND we.is_deleted = false
+  AND we.date >= now() - interval '6 months';
+"""
 
 RUN_SQL_TOOL = {
     "type": "function",
@@ -56,8 +144,8 @@ RUN_SQL_TOOL = {
     },
 }
 
-async def get_db_schema(pool) -> str:
-    """Fetch public schema structure."""
+async def get_db_schema(pool) -> dict:
+    """Fetch schema as {table_name: one-line description}."""
     query = """
         SELECT table_name, column_name, data_type
         FROM information_schema.columns
@@ -70,7 +158,7 @@ async def get_db_schema(pool) -> str:
     schema_dict = {}
     for row in rows:
         schema_dict.setdefault(row["table_name"], []).append(f"{row['column_name']} ({row['data_type']})")
-    return "\n".join([f"Table `{t}`: {', '.join(c)}" for t, c in schema_dict.items()])
+    return {t: f"Table `{t}`: {', '.join(c)}" for t, c in schema_dict.items()}
 
 async def org_fetch(pool, org_id: str, query: str, *args):
     """Read-only fetch with the RLS org scope applied."""
@@ -79,8 +167,9 @@ async def org_fetch(pool, org_id: str, query: str, *args):
             await conn.execute("SELECT set_config('app.org_id', $1, true)", org_id)
             return await conn.fetch(query, *args)
 
-async def execute_sql(pool, sql_query: str, org_id: str) -> str:
-    """Run SQL read-only; RLS (see rls.sql) hides rows outside org_id."""
+async def execute_sql(pool, sql_query: str, org_id: str) -> tuple:
+    """Run SQL read-only; RLS (see rls.sql) hides rows outside org_id.
+    Returns (result_json, ok)."""
     logger.info(f"SQL [{org_id}]: {sql_query}")
     try:
         rows = await org_fetch(pool, org_id, sql_query)
@@ -88,14 +177,46 @@ async def execute_sql(pool, sql_query: str, org_id: str) -> str:
         result = json.dumps([dict(row) for row in rows], default=str)
         if len(result) > MAX_RESULT_CHARS:
             result = result[:MAX_RESULT_CHARS] + f'"] (truncated, {len(rows)} rows total)'
-        return result
+        return result, True
     except Exception as e:
         logger.error(f"SQL Error: {e}")
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": str(e)}), False
 
-async def query_pipeline(user_prompt: str, pool, schema: str, org_id: str, locale: str, scope: str = "") -> tuple:
-    """Orchestrates LLM -> SQL -> LLM. Returns (reply, executed_sql or None)."""
-    system_prompt = f"""You are an AI with access to a PostgreSQL database.
+async def pick_tables(client, headers, question: str, table_names: list) -> list:
+    """Stage 1 of schema routing: cheap call with table names only."""
+    prompt = (f"Database tables:\n{', '.join(table_names)}\n\n"
+              f'Which of these tables are needed to answer: "{question}"?\n'
+              "Reply with the table names only, comma-separated.")
+    resp = await client.post(LITELLM_URL,
+                             json={"model": MODEL_NAME, "num_ctx": NUM_CTX,
+                                   "messages": [{"role": "user", "content": prompt}]},
+                             headers=headers)
+    resp.raise_for_status()
+    text = resp.json()["choices"][0]["message"]["content"] or ""
+    # match known names in the reply — no fragile JSON parsing of a small model
+    return [t for t in table_names if re.search(rf"\b{re.escape(t)}\b", text)]
+
+async def query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str, scope: str = "") -> tuple:
+    """Orchestrates routing -> LLM -> SQL (with self-correction) -> LLM.
+    Returns (reply, last_executed_sql or None)."""
+    headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        tables = list(schema_map)
+        if len(tables) > ROUTING_MIN_TABLES:
+            try:
+                picked = await pick_tables(client, headers, user_prompt, tables)
+            except Exception as e:
+                logger.warning(f"Table routing failed, using full schema: {e}")
+                picked = []
+            for t in ("farms", "herds"):  # scope filters reference these
+                if t in schema_map and t not in picked:
+                    picked.append(t)
+            if picked:
+                logger.info(f"Routing: {len(picked)}/{len(tables)} tables: {', '.join(picked)}")
+                tables = picked
+        schema = "\n".join(schema_map[t] for t in tables)
+
+        system_prompt = f"""You are an AI with access to a PostgreSQL database.
 DATABASE SCHEMA:
 {schema}
 This is a multi-tenant database. The current user's organization_id is '{org_id}'.{scope}
@@ -105,43 +226,54 @@ All ids are UUIDs — NEVER guess an id from a name. When the user mentions a fa
 herd, animal, or person by name, match it with a join and ILIKE (e.g.
 JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
 Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
-Always answer the user in {LANGUAGES.get(locale, "English")}."""
+Always answer the user in {LANGUAGES.get(locale, "English")}.
+{FEW_SHOTS}"""
 
-    headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"}
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        executed_sql = None
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        payload = {"model": MODEL_NAME, "messages": messages, "tools": [RUN_SQL_TOOL],
-                   "tool_choice": "auto", "num_ctx": NUM_CTX}
-        resp = await client.post(LITELLM_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        message = resp.json()["choices"][0]["message"]
+        for attempt in range(MAX_SQL_ATTEMPTS):
+            resp = await client.post(LITELLM_URL,
+                                     json={"model": MODEL_NAME, "messages": messages, "tools": [RUN_SQL_TOOL],
+                                           "tool_choice": "auto", "num_ctx": NUM_CTX},
+                                     headers=headers)
+            resp.raise_for_status()
+            message = resp.json()["choices"][0]["message"]
+            content = message.get("content") or ""
 
-        content = message.get("content") or ""
-        if message.get("tool_calls"):
-            tool_call = message["tool_calls"][0]
-            sql_query = json.loads(tool_call["function"]["arguments"]).get("sql_query", "")
-            messages.extend([message, {"role": "tool", "tool_call_id": tool_call["id"],
-                                       "content": await execute_sql(pool, sql_query, org_id)}])
-        else:
-            # ponytail: local models often emit the tool call as plain text
-            # instead of a structured tool_calls entry — salvage the SQL
-            m = re.search(r'"sql_query"\s*:\s*("(?:[^"\\]|\\.)*")', content)
-            if not m:
-                logger.info("LLM answered without SQL")
-                return content or "No response generated.", None
-            logger.info("Salvaged inline tool call from text response")
-            sql_query = json.loads(m.group(1))
-            db_result = await execute_sql(pool, sql_query, org_id)
-            messages.extend([
-                {"role": "assistant", "content": content},
-                {"role": "user", "content": f"Query result: {db_result}\nAnswer the original question using this data."},
-            ])
+            if message.get("tool_calls"):
+                tool_call = message["tool_calls"][0]
+                sql_query = json.loads(tool_call["function"]["arguments"]).get("sql_query", "")
+                db_result, ok = await execute_sql(pool, sql_query, org_id)
+                messages.extend([message, {"role": "tool", "tool_call_id": tool_call["id"], "content": db_result}])
+            else:
+                # ponytail: local models often emit the tool call as plain text
+                # instead of a structured tool_calls entry — salvage the SQL
+                m = re.search(r'"sql_query"\s*:\s*("(?:[^"\\]|\\.)*")', content)
+                if not m:
+                    logger.info("LLM answered without SQL")
+                    return content or "No response generated.", executed_sql
+                logger.info("Salvaged inline tool call from text response")
+                sql_query = json.loads(m.group(1))
+                db_result, ok = await execute_sql(pool, sql_query, org_id)
+                messages.extend([{"role": "assistant", "content": content},
+                                 {"role": "user", "content": f"Query result: {db_result}"}])
 
+            executed_sql = sql_query
+            if ok:
+                break
+            # self-correction: the model sees the error and gets another shot
+            logger.info(f"SQL failed (attempt {attempt + 1}/{MAX_SQL_ATTEMPTS}), asking model to fix it")
+            messages.append({"role": "user",
+                             "content": "The query failed with the error above. Fix the SQL "
+                                        "(check table and column names against the schema) and call run_sql_query again."})
+
+        messages.append({"role": "user", "content": "Answer the original question using the query results, "
+                                                    f"in {LANGUAGES.get(locale, 'English')}."})
         final_resp = await client.post(LITELLM_URL, json={"model": MODEL_NAME, "messages": messages,
                                                           "num_ctx": NUM_CTX}, headers=headers)
         final_resp.raise_for_status()
-        return final_resp.json()["choices"][0]["message"]["content"], sql_query
+        return final_resp.json()["choices"][0]["message"]["content"], executed_sql
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Log in with your account: /login <email> <password>")
@@ -323,10 +455,11 @@ async def post_init(app):
     """Create the pool inside PTB's event loop, cache the schema, set the command menu."""
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     app.bot_data["db_pool"] = pool
-    schema = await get_db_schema(pool)
-    app.bot_data["db_schema"] = schema
-    logger.info(f"Schema: {schema.count(chr(10)) + 1} tables, {len(schema)} chars "
-                f"(~{len(schema) // 4} tokens; num_ctx={NUM_CTX})")
+    schema_map = await get_db_schema(pool)
+    app.bot_data["db_schema"] = schema_map
+    total = sum(len(v) for v in schema_map.values())
+    logger.info(f"Schema: {len(schema_map)} tables, {total} chars (~{total // 4} tokens; "
+                f"num_ctx={NUM_CTX}; routing {'on' if len(schema_map) > ROUTING_MIN_TABLES else 'off'})")
     await app.bot.set_my_commands([
         BotCommand("login", "Log in: /login <email> <password>"),
         BotCommand("farm", "Choose the farm/herd your questions are about"),

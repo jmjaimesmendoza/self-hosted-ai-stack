@@ -3,10 +3,12 @@ services:
     image: hwdsl2/ollama-server
     container_name: ollama
     restart: always
+    # leave 4 of the 16 threads free so inference can't starve co-hosted services
+    cpus: 12
     volumes:
       - ollama-data:/var/lib/ollama
       - ollama-shared:/var/lib/ollama-shared
-      # - ./ollama.env:/ollama.env:ro  # optional: custom config
+      - ./ollama.env:/ollama.env:ro
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:11434/"]
       interval: 15s
