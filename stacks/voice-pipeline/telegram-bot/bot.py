@@ -3,6 +3,7 @@ import logging
 import os
 import re
 
+import anthropic
 import asyncpg
 import httpx
 from argon2 import PasswordHasher
@@ -35,6 +36,13 @@ SCHEMA_TABLES = [t.strip() for t in os.getenv("SCHEMA_TABLES", "").split(",") if
 NUM_CTX = int(os.getenv("NUM_CTX", "16384"))  # ollama context window per request
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))  # cold model load can take minutes on CPU
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))  # cap runaway generation (ollama default is unlimited)
+# qwen3 soft switch: skip multi-minute <think> spirals; harmless noise for other models
+NO_THINK = os.getenv("NO_THINK", "true").lower() == "true"
+# Claude API path: enabled when a key is present; otherwise the LiteLLM path runs
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5")
+anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
 TELEGRAM_MSG_LIMIT = 4096
@@ -183,13 +191,84 @@ async def execute_sql(pool, sql_query: str, org_id: str) -> tuple:
         logger.error(f"SQL Error: {e}")
         return json.dumps({"error": str(e)}), False
 
+# Same tool in the Anthropic Messages API shape (no "function" wrapper)
+CLAUDE_SQL_TOOL = {
+    "name": "run_sql_query",
+    "description": "Execute a SQL query against the PostgreSQL database.",
+    "input_schema": RUN_SQL_TOOL["function"]["parameters"],
+}
+
+async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str,
+                                locale: str, scope: str = "") -> tuple:
+    """SQL generation via the Claude API. Returns (reply, last_executed_sql or None)."""
+    schema = "\n".join(schema_map.values())
+    # Static block (identical across users/turns) is prompt-cached; the
+    # per-user specifics go in a second block after the cache breakpoint.
+    static_text = f"""You are an AI with access to a PostgreSQL database.
+DATABASE SCHEMA:
+{schema}
+This is a multi-tenant database. Every query MUST filter by the current user's
+organization_id (given below), directly or via a join to a table that has it.
+Rows with is_deleted = true must be excluded.
+All ids are UUIDs — NEVER guess an id from a name. When the user mentions a farm,
+herd, animal, or person by name, match it with a join and ILIKE (e.g.
+JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
+Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
+{FEW_SHOTS}"""
+    dynamic_text = (f"The current user's organization_id is '{org_id}'.{scope}\n"
+                    f"Always answer the user in {LANGUAGES.get(locale, 'English')}.")
+    system = [
+        {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": dynamic_text},
+    ]
+
+    messages = [{"role": "user", "content": user_prompt}]
+    executed_sql = None
+    sql_runs = 0
+    while True:
+        kwargs = dict(
+            model=ANTHROPIC_MODEL,
+            max_tokens=MAX_TOKENS,
+            system=system,
+            messages=messages,
+            tools=[CLAUDE_SQL_TOOL],
+            # policy declines are re-served by Anthropic's recommended fallback model
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+        )
+        if sql_runs >= MAX_SQL_ATTEMPTS:
+            kwargs["tool_choice"] = {"type": "none"}  # force a final answer
+        response = await anthropic_client.beta.messages.create(**kwargs)
+
+        if response.stop_reason == "refusal":
+            logger.warning("Claude declined the request (stop_reason=refusal)")
+            return "The model declined to answer this question.", executed_sql
+
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
+            reply = "".join(b.text for b in response.content if b.type == "text")
+            return reply or "No response generated.", executed_sql
+
+        messages.append({"role": "assistant", "content": response.content})
+        tool_results = []
+        for block in tool_blocks:
+            sql_query = block.input.get("sql_query", "")
+            executed_sql = sql_query
+            db_result, ok = await execute_sql(pool, sql_query, org_id)
+            if not ok:
+                logger.info(f"SQL failed (run {sql_runs + 1}/{MAX_SQL_ATTEMPTS}), Claude will retry")
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id,
+                                 "content": db_result, "is_error": not ok})
+            sql_runs += 1
+        messages.append({"role": "user", "content": tool_results})
+
 async def pick_tables(client, headers, question: str, table_names: list) -> list:
     """Stage 1 of schema routing: cheap call with table names only."""
     prompt = (f"Database tables:\n{', '.join(table_names)}\n\n"
               f'Which of these tables are needed to answer: "{question}"?\n'
               "Reply with the table names only, comma-separated.")
     resp = await client.post(LITELLM_URL,
-                             json={"model": MODEL_NAME, "num_ctx": NUM_CTX,
+                             json={"model": MODEL_NAME, "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS,
                                    "messages": [{"role": "user", "content": prompt}]},
                              headers=headers)
     resp.raise_for_status()
@@ -198,6 +277,12 @@ async def pick_tables(client, headers, question: str, table_names: list) -> list
     return [t for t in table_names if re.search(rf"\b{re.escape(t)}\b", text)]
 
 async def query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str, scope: str = "") -> tuple:
+    """Dispatch to the Claude API when a key is configured, else local LiteLLM."""
+    if anthropic_client:
+        return await claude_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope)
+    return await litellm_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope)
+
+async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str, scope: str = "") -> tuple:
     """Orchestrates routing -> LLM -> SQL (with self-correction) -> LLM.
     Returns (reply, last_executed_sql or None)."""
     headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"}
@@ -228,7 +313,7 @@ herd, animal, or person by name, match it with a join and ILIKE (e.g.
 JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
 Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
 Always answer the user in {LANGUAGES.get(locale, "English")}.
-{FEW_SHOTS}"""
+{FEW_SHOTS}{" /no_think" if NO_THINK else ""}"""
 
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         executed_sql = None
@@ -236,7 +321,7 @@ Always answer the user in {LANGUAGES.get(locale, "English")}.
         for attempt in range(MAX_SQL_ATTEMPTS):
             resp = await client.post(LITELLM_URL,
                                      json={"model": MODEL_NAME, "messages": messages, "tools": [RUN_SQL_TOOL],
-                                           "tool_choice": "auto", "num_ctx": NUM_CTX},
+                                           "tool_choice": "auto", "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS},
                                      headers=headers)
             resp.raise_for_status()
             message = resp.json()["choices"][0]["message"]
@@ -272,7 +357,7 @@ Always answer the user in {LANGUAGES.get(locale, "English")}.
         messages.append({"role": "user", "content": "Answer the original question using the query results, "
                                                     f"in {LANGUAGES.get(locale, 'English')}."})
         final_resp = await client.post(LITELLM_URL, json={"model": MODEL_NAME, "messages": messages,
-                                                          "num_ctx": NUM_CTX}, headers=headers)
+                                                          "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS}, headers=headers)
         final_resp.raise_for_status()
         return final_resp.json()["choices"][0]["message"]["content"], executed_sql
 
@@ -460,8 +545,12 @@ async def post_init(app):
     schema_map = await get_db_schema(pool)
     app.bot_data["db_schema"] = schema_map
     total = sum(len(v) for v in schema_map.values())
-    logger.info(f"Schema: {len(schema_map)} tables, {total} chars (~{total // 4} tokens; "
-                f"num_ctx={NUM_CTX}; routing {'on' if len(schema_map) > ROUTING_MIN_TABLES else 'off'})")
+    if anthropic_client:
+        provider = f"Claude API ({ANTHROPIC_MODEL})"
+    else:
+        provider = f"LiteLLM ({MODEL_NAME}; num_ctx={NUM_CTX}; " \
+                   f"routing {'on' if len(schema_map) > ROUTING_MIN_TABLES else 'off'})"
+    logger.info(f"Schema: {len(schema_map)} tables, {total} chars (~{total // 4} tokens); LLM: {provider}")
     await app.bot.set_my_commands([
         BotCommand("login", "Log in: /login <email> <password>"),
         BotCommand("farm", "Choose the farm/herd your questions are about"),

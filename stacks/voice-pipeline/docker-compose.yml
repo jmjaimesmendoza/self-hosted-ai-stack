@@ -109,6 +109,8 @@ services:
       - MODEL_NAME=${MODEL_NAME:-qwen2.5-coder:14b}
       - DEBUG_MODE=${DEBUG_MODE:-false}
       - DB_SCHEMA=${DB_SCHEMA:-tractor}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-opus-5}
       - SCHEMA_TABLES=${SCHEMA_TABLES:-}
       - NUM_CTX=${NUM_CTX:-16384}
     depends_on:
