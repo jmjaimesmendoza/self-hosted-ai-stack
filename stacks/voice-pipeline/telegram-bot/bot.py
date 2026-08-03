@@ -52,6 +52,7 @@ elif KIMI_API_KEY:
     anthropic_client, LLM_MODEL = anthropic.AsyncAnthropic(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL), KIMI_MODEL
 else:
     anthropic_client, LLM_MODEL = None, None
+LLM_BACKEND = "anthropic" if ANTHROPIC_API_KEY else "kimi" if KIMI_API_KEY else "local"
 
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
 TELEGRAM_MSG_LIMIT = 4096
@@ -528,6 +529,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if herd:
             scope += (f"\nWithin that farm, herd '{herd['name']}' (herds.id = '{herd['id']}') — "
                       "scope to this herd unless told otherwise.")
+        if DEBUG_MODE:
+            await update.effective_message.reply_text(f"🔧 LLM: {LLM_BACKEND} ({LLM_MODEL or 'litellm'})")
         reply, executed_sql = await query_pipeline(prompt, pool, context.bot_data["db_schema"], org_id,
                                                    context.user_data.get("locale") or "ES", scope)
         if DEBUG_MODE and executed_sql:
