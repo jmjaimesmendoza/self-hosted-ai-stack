@@ -31,8 +31,9 @@ BEGIN
   END IF;
 END $$;
 
--- The role may pre-exist: make sure it can't sidestep RLS or DDL its way out
-ALTER ROLE speech_sql_user LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+-- The role may pre-exist: make sure it can't sidestep RLS or DDL its way out.
+-- (No NOSUPERUSER here: RDS masters aren't superusers and can't set it.)
+ALTER ROLE speech_sql_user LOGIN NOBYPASSRLS NOCREATEDB NOCREATEROLE;
 
 GRANT USAGE ON SCHEMA tractor TO speech_sql_user;
 -- unqualified table names in bot queries resolve to the app schema
