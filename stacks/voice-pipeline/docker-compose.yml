@@ -116,6 +116,9 @@ services:
       - KIMI_MODEL=${KIMI_MODEL:-kimi-k3}
       - SCHEMA_TABLES=${SCHEMA_TABLES:-}
       - NUM_CTX=${NUM_CTX:-16384}
+      - PERSIST_PATH=/data/bot_state.pickle
+    volumes:
+      - telegram-bot-data:/data
     depends_on:
       litellm:
         condition: service_healthy
@@ -146,5 +149,7 @@ volumes:
     name: ai-stack-shared
   litellm-db:
     name: litellm-db
+  telegram-bot-data:
+    name: telegram-bot-data
   # whisper-live-data:
   #   name: whisper-live-data

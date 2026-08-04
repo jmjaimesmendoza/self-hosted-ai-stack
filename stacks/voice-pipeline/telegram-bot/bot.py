@@ -19,6 +19,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PersistenceInput,
+    PicklePersistence,
     filters,
 )
 
@@ -35,6 +37,8 @@ WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")  # `docker exec whisper whisp
 LITELLM_URL = os.getenv("LITELLM_URL", "http://litellm:4000/v1/chat/completions")
 DATABASE_URL = os.getenv("DATABASE_URL")  # no default: the fallback was a superuser URL, and owners bypass RLS
 DB_ROLE = os.getenv("DB_ROLE", "speech_sql_user")  # post_init asserts we connect as this role (rls.sql)
+# sessions survive restarts; mount a volume here in compose or logins die with every deploy
+PERSIST_PATH = os.getenv("PERSIST_PATH", "bot_state.pickle")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:14b")
 DB_SCHEMA = os.getenv("DB_SCHEMA", "tractor")
 # comma-separated table allowlist to keep the prompt small; empty = all visible tables
@@ -200,7 +204,10 @@ async def edit_html(status, text: str):
     try:
         await status.edit_text(md_to_html(text)[:TELEGRAM_MSG_LIMIT], parse_mode="HTML")
     except BadRequest:  # e.g. tag cut in half by the length cap
-        await status.edit_text(text[:TELEGRAM_MSG_LIMIT])
+        try:
+            await status.edit_text(text[:TELEGRAM_MSG_LIMIT])
+        except BadRequest:  # e.g. "message is not modified" — nothing left to salvage
+            logger.warning("edit_html fallback failed", exc_info=True)
 
 hasher = PasswordHasher()
 
@@ -343,9 +350,12 @@ async def execute_sql(pool, sql_query: str, org_id: str, sw: Stopwatch) -> tuple
     try:
         rows = await org_fetch(pool, org_id, sql_query)
         logger.info(f"SQL result: {len(rows)} rows")
-        result = json.dumps([dict(row) for row in rows], default=str)
-        if len(result) > MAX_RESULT_CHARS:
-            result = result[:MAX_RESULT_CHARS] + f'"] (truncated, {len(rows)} rows total)'
+        kept = [dict(row) for row in rows]
+        result = json.dumps(kept, default=str)
+        # drop whole rows until it fits — a mid-string char slice handed the model broken JSON
+        while len(result) > MAX_RESULT_CHARS and kept:
+            kept = kept[: len(kept) // 2]
+            result = json.dumps(kept + [f"(truncated, showing {len(kept)} of {len(rows)} rows)"], default=str)
         sw.lap("db")
         return result, True
     except Exception as e:
@@ -711,10 +721,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pool = context.bot_data["db_pool"]
     is_voice = bool(update.message.voice)
-    # one status message, edited in place as stages complete
-    status = await update.message.reply_text("🎙 Transcribing…" if is_voice else "🔍 Querying the database…")
-
+    status = None  # created inside the try so a failed send can't leak busy=True
     try:
+        # one status message, edited in place as stages complete
+        status = await update.message.reply_text("🎙 Transcribing…" if is_voice else "🔍 Querying the database…")
         echo, prompt = "", ""
         if is_voice:
             voice_file = await context.bot.get_file(update.message.voice.file_id)
@@ -777,12 +787,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          "content": f"(No answer was produced — the request failed with {type(e).__name__}. "
                                     "The user may retry or rephrase.)"}]
             del history[:-HISTORY_MAX]
-        if DEBUG_MODE:
-            # repr(): timeouts and friends often have an empty str()
-            await status.edit_text(f"⚠️ DEBUG ERROR: {e!r}"[:TELEGRAM_MSG_LIMIT])
-        else:
-            await status.edit_text("Something went wrong with that question. "
-                                   "You can say “try again”, rephrase it, or narrow it down.")
+        if status:
+            if DEBUG_MODE:
+                # repr(): timeouts and friends often have an empty str()
+                await status.edit_text(f"⚠️ DEBUG ERROR: {e!r}"[:TELEGRAM_MSG_LIMIT])
+            else:
+                await status.edit_text("Something went wrong with that question. "
+                                       "You can say “try again”, rephrase it, or narrow it down.")
     finally:
         context.user_data["busy"] = False
 
@@ -797,6 +808,8 @@ async def post_init(app):
     app.bot_data["db_pool"] = pool
     schema_map = await get_db_schema(pool)
     app.bot_data["db_schema"] = schema_map
+    for ud in app.user_data.values():  # a crash mid-request must not persist a stuck busy flag
+        ud.pop("busy", None)
     total = sum(len(v) for v in schema_map.values())
     if anthropic_client:
         name = "Claude API" if ANTHROPIC_API_KEY else "Kimi (Anthropic-compatible)"
@@ -821,15 +834,31 @@ async def post_shutdown(app):
     await http_client.aclose()
     await app.bot_data["db_pool"].close()
 
+async def on_error(update, context):
+    """Last-resort handler: most command handlers have no try/except of their own."""
+    logger.error("Unhandled error", exc_info=context.error)
+    msg = getattr(update, "effective_message", None)
+    if msg:
+        try:
+            await msg.reply_text("Something went wrong — please try again.")
+        except Exception:
+            pass
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN")
     if not DATABASE_URL:
         raise ValueError("Missing DATABASE_URL")
 
+    # bot_data holds the (unpicklable) pool and schema — persist user_data only
+    persistence = PicklePersistence(filepath=PERSIST_PATH,
+                                    store_data=PersistenceInput(bot_data=False, chat_data=False,
+                                                                callback_data=False))
     app = (ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
            .concurrent_updates(True)  # default processes updates one-by-one: one slow query blocked every user
+           .persistence(persistence)
            .post_init(post_init).post_shutdown(post_shutdown).build())
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("whoami", whoami))
