@@ -328,7 +328,7 @@ Never announce that you are going to look something up or run a query — either
 now with the tool, or ask your clarifying question. Your reply ends the turn.
 {GROUNDING}
 In your answer, format dates like 15/03/2024 (no timestamps unless asked), round decimals
-sensibly (e.g. 512.5 kg, ages as whole years), and never show UUIDs.
+sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show UUIDs.
 {FEW_SHOTS}"""
     dynamic_text = (f"The current user's organization_id is '{org_id}'.{scope}\n"
                     f"Always answer the user in {LANGUAGES.get(locale, 'English')}.\n"
