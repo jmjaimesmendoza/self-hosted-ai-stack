@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LITELLM_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "")
 WHISPER_URL = os.getenv("WHISPER_URL", "http://whisper:9000/v1/audio/transcriptions")
+WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")  # `docker exec whisper whisper_manage --getkey`
 LITELLM_URL = os.getenv("LITELLM_URL", "http://litellm:4000/v1/chat/completions")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/postgres")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:14b")
@@ -546,7 +547,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             voice_file = await context.bot.get_file(update.message.voice.file_id)
             voice_bytes = await voice_file.download_as_bytearray()
             async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(WHISPER_URL, files={"file": ("voice.ogg", bytes(voice_bytes))}, data={"model": "whisper-1"})
+                r = await client.post(WHISPER_URL, files={"file": ("voice.ogg", bytes(voice_bytes))}, data={"model": "whisper-1"},
+                                      headers={"Authorization": f"Bearer {WHISPER_API_KEY}"} if WHISPER_API_KEY else {})
                 r.raise_for_status()
                 prompt = r.json().get("text", "").strip()
             if not prompt:
