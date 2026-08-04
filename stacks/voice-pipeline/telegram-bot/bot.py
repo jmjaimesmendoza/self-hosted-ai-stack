@@ -370,14 +370,11 @@ CLAUDE_SQL_TOOL = {
     "input_schema": RUN_SQL_TOOL["function"]["parameters"],
 }
 
-async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str,
-                                locale: str, scope: str = "", history: list = None,
-                                sw: Stopwatch = None) -> tuple:
-    """SQL generation via the Claude API. Returns (reply, last_executed_sql or None)."""
-    schema = "\n".join(schema_map.values())
-    # Static block (identical across users/turns) is prompt-cached; the
-    # per-user specifics go in a second block after the cache breakpoint.
-    static_text = f"""You are an AI with access to a PostgreSQL database.
+def build_prompts(schema: str, org_id: str, scope: str, locale: str) -> tuple:
+    """(static, dynamic) system-prompt blocks shared by both pipelines.
+    static is byte-stable across users/turns so the Claude path can prompt-cache it;
+    the LiteLLM path concatenates both into one system message."""
+    static = f"""You are an AI with access to a PostgreSQL database.
 DATABASE SCHEMA:
 {schema}
 This is a multi-tenant database. Every query MUST filter by the current user's
@@ -394,10 +391,21 @@ now with the tool, or ask your clarifying question. Your reply ends the turn.
 {GROUNDING}
 In your answer, format dates like 15/03/2024 (no timestamps unless asked), round decimals
 sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show UUIDs.
+Format answers in simple Markdown only: **bold**, `code`, and "- " bullet lists.
+No headers, tables, links, or italics.
 {FEW_SHOTS}"""
-    dynamic_text = (f"The current user's organization_id is '{org_id}'.{scope}\n"
-                    f"Always answer the user in {LANGUAGES.get(locale, 'English')}.\n"
-                    f"{enum_labels_text(locale)}")
+    dynamic = (f"The current user's organization_id is '{org_id}'.{scope}\n"
+               f"Always answer the user in {LANGUAGES.get(locale, 'English')}.\n"
+               f"{enum_labels_text(locale)}")
+    return static, dynamic
+
+async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str,
+                                locale: str, scope: str = "", history: list = None,
+                                sw: Stopwatch = None) -> tuple:
+    """SQL generation via the Claude API. Returns (reply, last_executed_sql or None)."""
+    # Static block (identical across users/turns) is prompt-cached; the
+    # per-user specifics go in a second block after the cache breakpoint.
+    static_text, dynamic_text = build_prompts("\n".join(schema_map.values()), org_id, scope, locale)
     system = [
         # 1h TTL: the default 5-minute cache almost never hits on a low-traffic bot
         {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
@@ -497,30 +505,9 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
             if picked:
                 logger.info(f"Routing: {len(picked)}/{len(tables)} tables: {', '.join(picked)}")
                 tables = picked
-        schema = "\n".join(schema_map[t] for t in tables)
-
-        system_prompt = f"""You are an AI with access to a PostgreSQL database.
-DATABASE SCHEMA:
-{schema}
-This is a multi-tenant database. The current user's organization_id is '{org_id}'.{scope}
-Every query MUST filter by organization_id = '{org_id}' (directly or via a join
-to a table that has it). Rows with is_deleted = true must be excluded.
-All ids are UUIDs — NEVER guess an id from a name. When the user mentions a farm,
-herd, animal, or person by name, match it with a join and ILIKE (e.g.
-JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
-Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
-If the question is ambiguous or missing information you need (which farm, which period,
-which animals), ask a short clarifying question instead of guessing.
-Never announce that you are going to look something up or run a query — either run it
-now with the tool, or ask your clarifying question. Your reply ends the turn.
-{GROUNDING}
-In your answer, format dates like 15/03/2024 (no timestamps unless asked), round decimals
-sensibly (e.g. 512.5 kg, ages as whole years), and never show UUIDs.
-Format answers in simple Markdown only: **bold**, `code`, and "- " bullet lists.
-No headers, tables, links, or italics.
-Always answer the user in {LANGUAGES.get(locale, "English")}.
-{enum_labels_text(locale)}
-{FEW_SHOTS}{" /no_think" if NO_THINK else ""}"""
+        static_text, dynamic_text = build_prompts("\n".join(schema_map[t] for t in tables),
+                                                  org_id, scope, locale)
+        system_prompt = static_text + "\n" + dynamic_text + (" /no_think" if NO_THINK else "")
 
         # ponytail: table routing above only sees the current question, not history —
         # feed the last user turn into pick_tables if follow-ups route to wrong tables
@@ -575,6 +562,13 @@ Always answer the user in {LANGUAGES.get(locale, "English")}.
         sw.lap("llm")
         return final_resp.json()["choices"][0]["message"]["content"], executed_sql
 
+async def require_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return org_id, or None after telling the user to log in."""
+    org_id = context.user_data.get("org_id")
+    if not org_id:
+        await update.effective_message.reply_text("Please log in first: /login <email> <password>")
+    return org_id
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Log in with your account: /login <email> <password>")
 
@@ -620,8 +614,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await chat.send_message(f"Logged in as {row['name']}. Send me a question (text or voice).")
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("org_id"):
-        await update.message.reply_text("Not logged in. Use /login <email> <password>")
+    if not await require_login(update, context):
         return
     d = context.user_data
     farm = d.get("farm", {}).get("name", "all farms")
@@ -650,9 +643,8 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def farm_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Pick a farm (then a herd) to auto-scope all questions."""
-    org_id = context.user_data.get("org_id")
+    org_id = await require_login(update, context)
     if not org_id:
-        await update.message.reply_text("Please log in first: /login <email> <password>")
         return
     rows = await org_fetch(context.bot_data["db_pool"], org_id,
                            "SELECT id, name FROM farms WHERE is_deleted = false ORDER BY name")
@@ -709,9 +701,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generic handler for text/voice."""
-    org_id = context.user_data.get("org_id")
+    org_id = await require_login(update, context)
     if not org_id:
-        await update.message.reply_text("Please log in first: /login <email> <password>")
         return
 
     if context.user_data.get("busy"):

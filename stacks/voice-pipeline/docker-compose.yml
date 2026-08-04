@@ -117,6 +117,13 @@ services:
       - SCHEMA_TABLES=${SCHEMA_TABLES:-}
       - NUM_CTX=${NUM_CTX:-16384}
       - PERSIST_PATH=/data/bot_state.pickle
+      - DB_ROLE=${DB_ROLE:-speech_sql_user}
+      - WHISPER_URL=${WHISPER_URL:-http://whisper:9000/v1/audio/transcriptions}
+      - LITELLM_URL=${LITELLM_URL:-http://litellm:4000/v1/chat/completions}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-300}
+      - MAX_TOKENS=${MAX_TOKENS:-2000}
+      - NO_THINK=${NO_THINK:-true}
+      - KIMI_BASE_URL=${KIMI_BASE_URL:-https://api.moonshot.ai/anthropic}
     volumes:
       - telegram-bot-data:/data
     depends_on:
