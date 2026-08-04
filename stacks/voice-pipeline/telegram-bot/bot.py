@@ -71,6 +71,87 @@ FOOTERS = {
            "\n\n💬 Nenhuma consulta foi executada — responda para continuar."),
 }
 
+# Enum value -> (ES, EN, PT) label, keyed by the column the value comes from.
+# Labels copied from tractor-backend src/shared/constants/enum-labels.const.ts — keep in sync.
+ENUM_GLOSSARY = {
+    "animals.sex": {
+        "MALE": ("Macho", "Male", "Macho"),
+        "FEMALE": ("Hembra", "Female", "Fêmea"),
+    },
+    'animals."ageGroup"': {
+        "CALF": ("Becerro/a", "Calf", "Bezerro/a"),
+        "YEARLING": ("Mauta/e", "Yearling", "Garrote/a"),
+        "HEIFER": ("Novilla", "Heifer", "Novilha"),
+        "STEER": ("Novillo", "Steer", "Novilho"),
+        "COW": ("Vaca", "Cow", "Vaca"),
+        "BULL": ("Toro", "Bull", "Touro"),
+    },
+    "species": {
+        "BOS_INDICUS": ("Bos indicus",) * 3,
+        "BOS_TAURUS": ("Bos taurus",) * 3,
+        "BUBALUS_BUBALIS": ("Bubalus bubalis",) * 3,
+    },
+    'body condition (animals."bodyCondition", body_condition)': {
+        "GOOD": ("Buena", "Good", "Boa"),
+        "NORMAL": ("Normal", "Normal", "Normal"),
+        "POOR": ("Mala", "Poor", "Ruim"),
+    },
+    "gynecological_exams.result": {
+        "PREGNANT": ("Preñada", "Pregnant", "Prenhe"),
+        "NOT_PREGNANT": ("Vacía", "Not pregnant", "Vazia"),
+        "POSSIBLY_PREGNANT": ("Posiblemente preñada", "Possibly pregnant", "Possivelmente prenhe"),
+    },
+    "weigh_in_events.type": {
+        "BIRTH": ("Al Nacer", "At Birth", "Ao Nascer"),
+        "DRY_OFF": ("Al Secado", "At Dry-Off", "Ao Secar"),
+        "WEANING": ("Al Destete", "At Weaning", "Ao Desmame"),
+        "REGULAR": ("General", "Regular", "Geral"),
+        "SALE": ("Venta", "Sale", "Venda"),
+    },
+    "lactation_end_events.reason": {
+        "CALVING": ("Parto", "Calving", "Parto"),
+        "ABORTION": ("Aborto", "Abortion", "Aborto"),
+        "DRY_OFF": ("Secado", "Dry-off", "Secagem"),
+        "OTHER": ("Otro", "Other", "Outro"),
+    },
+    "birth_events.birth_type": {
+        "NORMAL": ("Normal", "Normal", "Normal"),
+        "ASSISTED": ("Asistido", "Assisted", "Assistido"),
+        "ABORTION": ("Aborto", "Abortion", "Aborto"),
+    },
+    "birth_event_calves_information.birth_condition": {
+        "NORMAL": ("Normal", "Normal", "Normal"),
+        "DYSTOCIC": ("Distócico", "Dystocic", "Distócico"),
+        "STILLBORN": ("Mortinato", "Stillborn", "Natimorto"),
+    },
+    "service_events.service_type": {
+        "NATURAL": ("Monta natural", "Natural mating", "Monta natural"),
+        "ARTIFICIAL_INSEMINATION": ("Inseminación artificial", "Artificial insemination", "Inseminação artificial"),
+        "EMBRYO_TRANSFER": ("Transferencia de embrión", "Embryo transfer", "Transferência de embrião"),
+        "IN_VITRO_FERTILIZATION": ("Fertilización in vitro", "In vitro fertilization", "Fertilização in vitro"),
+    },
+    "mastitis_checks.result": {
+        "NEGATIVE": ("Negativo", "Negative", "Negativo"),
+        "SIGNS": ("Con signos", "With signs", "Com sinais"),
+        "WEAK_POSITIVE": ("Positivo débil", "Weak positive", "Positivo fraco"),
+        "STRONG_POSITIVE": ("Positivo fuerte", "Strong positive", "Positivo forte"),
+    },
+    "animal_creation_events.reason": {
+        "BIRTH": ("Nacimiento", "Birth", "Nascimento"),
+        "PURCHASE": ("Compra", "Purchase", "Compra"),
+        "TRANSFER": ("Traslado", "Transfer", "Transferência"),
+        "OTHER": ("Otro", "Other", "Outro"),
+    },
+}
+
+def enum_labels_text(locale: str) -> str:
+    """Per-locale glossary block so the model writes labels, never raw enum codes."""
+    i = {"ES": 0, "EN": 1, "PT": 2}.get(locale, 1)
+    lines = [f"- {col}: " + ", ".join(f"{v}={labels[i]}" for v, labels in vals.items())
+             for col, vals in ENUM_GLOSSARY.items()]
+    return ("ENUM LABELS — in your answer never show raw enum codes; "
+            "use these labels instead:\n" + "\n".join(lines))
+
 hasher = PasswordHasher()
 
 # Known-good question -> SQL pairs; :farmId/:herdId are placeholders the model
@@ -159,6 +240,12 @@ WHERE we.type = 'WEANING' AND we.is_deleted = false
   AND we.date >= now() - interval '6 months';
 """
 
+GROUNDING = """Every number, date, or value in your answer must come from a query result
+in this conversation — NEVER invent, estimate, or fill in data. On a follow-up question,
+first check whether earlier query results already contain the answer; if they don't, run a
+NEW query reusing the context (same animal, farm, period). If the database cannot answer
+it at all, say so plainly instead of guessing."""
+
 RUN_SQL_TOOL = {
     "type": "function",
     "function": {
@@ -239,9 +326,13 @@ If the question is ambiguous or missing information you need (which farm, which 
 which animals), ask a short clarifying question instead of guessing.
 Never announce that you are going to look something up or run a query — either run it
 now with the tool, or ask your clarifying question. Your reply ends the turn.
+{GROUNDING}
+In your answer, format dates like 15/03/2024 (no timestamps unless asked), round decimals
+sensibly (e.g. 512.5 kg, ages as whole years), and never show UUIDs.
 {FEW_SHOTS}"""
     dynamic_text = (f"The current user's organization_id is '{org_id}'.{scope}\n"
-                    f"Always answer the user in {LANGUAGES.get(locale, 'English')}.")
+                    f"Always answer the user in {LANGUAGES.get(locale, 'English')}.\n"
+                    f"{enum_labels_text(locale)}")
     system = [
         {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": dynamic_text},
@@ -349,7 +440,11 @@ If the question is ambiguous or missing information you need (which farm, which 
 which animals), ask a short clarifying question instead of guessing.
 Never announce that you are going to look something up or run a query — either run it
 now with the tool, or ask your clarifying question. Your reply ends the turn.
+{GROUNDING}
+In your answer, format dates like 15/03/2024 (no timestamps unless asked), round decimals
+sensibly (e.g. 512.5 kg, ages as whole years), and never show UUIDs.
 Always answer the user in {LANGUAGES.get(locale, "English")}.
+{enum_labels_text(locale)}
 {FEW_SHOTS}{" /no_think" if NO_THINK else ""}"""
 
         # ponytail: table routing above only sees the current question, not history —
