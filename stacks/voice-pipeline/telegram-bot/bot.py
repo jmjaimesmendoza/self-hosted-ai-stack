@@ -409,6 +409,7 @@ sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show 
                 # body on slow requests — the SDK won't retry a "successful" status
                 logger.warning(f"Non-JSON body from LLM API, retrying ({retry + 1}/3)")
         else:
+            sw.lap("llm")  # close the interval so the failed retries aren't booked as format
             return "The AI service returned an empty response — please try again.", executed_sql
         sw.lap("llm")  # retries fold into one entry
 
@@ -468,6 +469,7 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
                 picked = await pick_tables(client, headers, user_prompt, tables)
                 sw.lap("llm")
             except Exception as e:
+                sw.lap("llm")  # close the interval so the failed call isn't booked as bot_llm
                 logger.warning(f"Table routing failed, using full schema: {e}")
                 picked = []
             for t in ("farms", "herds"):  # scope filters reference these
@@ -746,12 +748,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_html(status, echo + (reply or "No response generated.") + footer)
         sw.lap("format")
         if DEBUG_MODE:
-            avg = context.user_data.setdefault("timings_avg", {})
-            for k, v in sw.d.items():
-                if v:
-                    s, n = avg.get(k, (0.0, 0))
-                    avg[k] = (s + sum(v), n + 1)
-            await update.effective_message.reply_text(f"<pre>⏱\n{fmt_timings(sw.d)}</pre>", parse_mode="HTML")
+            try:  # the answer is already delivered — a failed report must not reach the outer except
+                avg = context.user_data.setdefault("timings_avg", {})
+                for k, v in sw.d.items():
+                    if v:
+                        s, n = avg.get(k, (0.0, 0))
+                        avg[k] = (s + sum(v), n + 1)
+                await update.effective_message.reply_text(f"<pre>⏱\n{fmt_timings(sw.d)}</pre>", parse_mode="HTML")
+            except Exception:
+                logger.exception("Timing report failed")
 
     except Exception as e:
         logger.exception("Handler Error")
