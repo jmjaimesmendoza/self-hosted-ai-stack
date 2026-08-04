@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import anthropic
 import asyncpg
@@ -154,6 +155,30 @@ def enum_labels_text(locale: str) -> str:
     return ("ENUM LABELS — in your answer never show raw enum codes; "
             "use these labels instead:\n" + "\n".join(lines))
 
+class Stopwatch:
+    """Interval timer: each lap records time since the previous lap under a key."""
+    KEYS = ("bot_llm", "llm", "bot_db", "db", "format")
+
+    def __init__(self):
+        self.t = time.perf_counter()
+        self.d = {k: [] for k in self.KEYS}
+
+    def lap(self, key):
+        now = time.perf_counter()
+        self.d[key].append(now - self.t)
+        self.t = now
+
+def fmt_timings(d: dict) -> str:
+    """'llm: 1.23s + 0.98s = 2.21s' per interval; empty intervals skipped; total line last."""
+    lines = []
+    for k, v in d.items():
+        if not v:
+            continue
+        parts = " + ".join(f"{t:.2f}s" for t in v)
+        lines.append(f"{k}: {parts}" + (f" = {sum(v):.2f}s" if len(v) > 1 else ""))
+    lines.append(f"total: {sum(sum(v) for v in d.values()):.2f}s")
+    return "\n".join(lines)
+
 def md_to_html(text: str) -> str:
     """Telegram-safe HTML from the simple Markdown subset the model emits.
     Everything is escaped first, so unmatched markers can never break the send."""
@@ -303,9 +328,10 @@ async def org_fetch(pool, org_id: str, query: str, *args):
             await conn.execute("SELECT set_config('app.org_id', $1, true)", org_id)
             return await conn.fetch(query, *args)
 
-async def execute_sql(pool, sql_query: str, org_id: str) -> tuple:
+async def execute_sql(pool, sql_query: str, org_id: str, sw: Stopwatch) -> tuple:
     """Run SQL read-only; RLS (see rls.sql) hides rows outside org_id.
     Returns (result_json, ok)."""
+    sw.lap("bot_db")
     logger.info(f"SQL [{org_id}]: {sql_query}")
     try:
         rows = await org_fetch(pool, org_id, sql_query)
@@ -313,9 +339,11 @@ async def execute_sql(pool, sql_query: str, org_id: str) -> tuple:
         result = json.dumps([dict(row) for row in rows], default=str)
         if len(result) > MAX_RESULT_CHARS:
             result = result[:MAX_RESULT_CHARS] + f'"] (truncated, {len(rows)} rows total)'
+        sw.lap("db")
         return result, True
     except Exception as e:
         logger.error(f"SQL Error: {e}")
+        sw.lap("db")
         return json.dumps({"error": str(e)}), False
 
 # Same tool in the Anthropic Messages API shape (no "function" wrapper)
@@ -326,7 +354,8 @@ CLAUDE_SQL_TOOL = {
 }
 
 async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str,
-                                locale: str, scope: str = "", history: list = None) -> tuple:
+                                locale: str, scope: str = "", history: list = None,
+                                sw: Stopwatch = None) -> tuple:
     """SQL generation via the Claude API. Returns (reply, last_executed_sql or None)."""
     schema = "\n".join(schema_map.values())
     # Static block (identical across users/turns) is prompt-cached; the
@@ -370,6 +399,7 @@ sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show 
         )
         if sql_runs >= MAX_SQL_ATTEMPTS:
             kwargs["tool_choice"] = {"type": "none"}  # force a final answer
+        sw.lap("bot_llm")
         for retry in range(3):
             try:
                 response = await anthropic_client.messages.create(**kwargs)
@@ -380,6 +410,7 @@ sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show 
                 logger.warning(f"Non-JSON body from LLM API, retrying ({retry + 1}/3)")
         else:
             return "The AI service returned an empty response — please try again.", executed_sql
+        sw.lap("llm")  # retries fold into one entry
 
         if response.stop_reason == "refusal":
             logger.warning("Claude declined the request (stop_reason=refusal)")
@@ -395,7 +426,7 @@ sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show 
         for block in tool_blocks:
             sql_query = block.input.get("sql_query", "")
             executed_sql = sql_query
-            db_result, ok = await execute_sql(pool, sql_query, org_id)
+            db_result, ok = await execute_sql(pool, sql_query, org_id, sw)
             if not ok:
                 logger.info(f"SQL failed (run {sql_runs + 1}/{MAX_SQL_ATTEMPTS}), Claude will retry")
             tool_results.append({"type": "tool_result", "tool_use_id": block.id,
@@ -418,14 +449,14 @@ async def pick_tables(client, headers, question: str, table_names: list) -> list
     return [t for t in table_names if re.search(rf"\b{re.escape(t)}\b", text)]
 
 async def query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str,
-                         scope: str = "", history: list = None) -> tuple:
+                         scope: str = "", history: list = None, sw: Stopwatch = None) -> tuple:
     """Dispatch to the Claude API when a key is configured, else local LiteLLM."""
     if anthropic_client:
-        return await claude_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history)
-    return await litellm_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history)
+        return await claude_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history, sw)
+    return await litellm_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history, sw)
 
 async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str,
-                                 scope: str = "", history: list = None) -> tuple:
+                                 scope: str = "", history: list = None, sw: Stopwatch = None) -> tuple:
     """Orchestrates routing -> LLM -> SQL (with self-correction) -> LLM.
     Returns (reply, last_executed_sql or None)."""
     headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"}
@@ -433,7 +464,9 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
         tables = list(schema_map)
         if len(tables) > ROUTING_MIN_TABLES:
             try:
+                sw.lap("bot_llm")
                 picked = await pick_tables(client, headers, user_prompt, tables)
+                sw.lap("llm")
             except Exception as e:
                 logger.warning(f"Table routing failed, using full schema: {e}")
                 picked = []
@@ -475,18 +508,20 @@ Always answer the user in {LANGUAGES.get(locale, "English")}.
         executed_sql = None
 
         for attempt in range(MAX_SQL_ATTEMPTS):
+            sw.lap("bot_llm")
             resp = await client.post(LITELLM_URL,
                                      json={"model": MODEL_NAME, "messages": messages, "tools": [RUN_SQL_TOOL],
                                            "tool_choice": "auto", "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS},
                                      headers=headers)
             resp.raise_for_status()
+            sw.lap("llm")
             message = resp.json()["choices"][0]["message"]
             content = message.get("content") or ""
 
             if message.get("tool_calls"):
                 tool_call = message["tool_calls"][0]
                 sql_query = json.loads(tool_call["function"]["arguments"]).get("sql_query", "")
-                db_result, ok = await execute_sql(pool, sql_query, org_id)
+                db_result, ok = await execute_sql(pool, sql_query, org_id, sw)
                 messages.extend([message, {"role": "tool", "tool_call_id": tool_call["id"], "content": db_result}])
             else:
                 # ponytail: local models often emit the tool call as plain text
@@ -497,7 +532,7 @@ Always answer the user in {LANGUAGES.get(locale, "English")}.
                     return content or "No response generated.", executed_sql
                 logger.info("Salvaged inline tool call from text response")
                 sql_query = json.loads(m.group(1))
-                db_result, ok = await execute_sql(pool, sql_query, org_id)
+                db_result, ok = await execute_sql(pool, sql_query, org_id, sw)
                 messages.extend([{"role": "assistant", "content": content},
                                  {"role": "user", "content": f"Query result: {db_result}"}])
 
@@ -512,9 +547,11 @@ Always answer the user in {LANGUAGES.get(locale, "English")}.
 
         messages.append({"role": "user", "content": "Answer the original question using the query results, "
                                                     f"in {LANGUAGES.get(locale, 'English')}."})
+        sw.lap("bot_llm")
         final_resp = await client.post(LITELLM_URL, json={"model": MODEL_NAME, "messages": messages,
                                                           "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS}, headers=headers)
         final_resp.raise_for_status()
+        sw.lap("llm")
         return final_resp.json()["choices"][0]["message"]["content"], executed_sql
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -572,6 +609,15 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Logged in as {d['name']} ({d['email']})\nOrganization: {d['org_id']}\n"
         f"Language: {d.get('locale') or 'ES'}\nScope: {farm} / {herd}"
     )
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Session timing averages (debug mode only; averages of per-request sums)."""
+    avg = context.user_data.get("timings_avg")
+    if not avg:
+        await update.message.reply_text("No timing data this session yet.")
+        return
+    lines = "\n".join(f"{k}: {s / n:.2f}s avg ({n} req)" for k, (s, n) in avg.items())
+    await update.message.reply_text(f"<pre>⏱ session averages\n{lines}</pre>", parse_mode="HTML")
 
 async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("history", None)
@@ -686,9 +732,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       "scope to this herd unless told otherwise.")
         if DEBUG_MODE:
             await update.effective_message.reply_text(f"🔧 LLM: {LLM_BACKEND} ({LLM_MODEL or 'litellm'})")
+        sw = Stopwatch()  # ponytail: always runs; laps are ~ns, gating only at report time
         reply, executed_sql = await query_pipeline(prompt, pool, context.bot_data["db_schema"], org_id,
                                                    context.user_data.get("locale") or "ES", scope,
-                                                   context.user_data.get("history"))
+                                                   context.user_data.get("history"), sw)
         if reply:
             history = context.user_data.setdefault("history", [])
             history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": reply}]
@@ -697,6 +744,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = f"{reply or ''}\n\n🔧 SQL:\n```sql\n{executed_sql}\n```"
         footer = FOOTERS.get(context.user_data.get("locale") or "ES", FOOTERS["ES"])[0 if executed_sql else 1]
         await edit_html(status, echo + (reply or "No response generated.") + footer)
+        sw.lap("format")
+        if DEBUG_MODE:
+            avg = context.user_data.setdefault("timings_avg", {})
+            for k, v in sw.d.items():
+                if v:
+                    s, n = avg.get(k, (0.0, 0))
+                    avg[k] = (s + sum(v), n + 1)
+            await update.effective_message.reply_text(f"<pre>⏱\n{fmt_timings(sw.d)}</pre>", parse_mode="HTML")
 
     except Exception as e:
         logger.exception("Handler Error")
@@ -731,13 +786,16 @@ async def post_init(app):
         provider = f"LiteLLM ({MODEL_NAME}; num_ctx={NUM_CTX}; " \
                    f"routing {'on' if len(schema_map) > ROUTING_MIN_TABLES else 'off'})"
     logger.info(f"Schema: {len(schema_map)} tables, {total} chars (~{total // 4} tokens); LLM: {provider}")
-    await app.bot.set_my_commands([
+    commands = [
         BotCommand("login", "Log in: /login <email> <password>"),
         BotCommand("farm", "Choose the farm/herd your questions are about"),
         BotCommand("new", "Start a new conversation (forget previous questions)"),
         BotCommand("whoami", "Show who is logged in and current scope"),
         BotCommand("logout", "Log out"),
-    ])
+    ]
+    if DEBUG_MODE:
+        commands.append(BotCommand("stats", "Timing averages for this session (debug)"))
+    await app.bot.set_my_commands(commands)
     logger.info("DB pool ready, schema cached.")
 
 def main():
@@ -751,6 +809,8 @@ def main():
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("logout", logout))
     app.add_handler(CommandHandler("farm", farm_menu))
+    if DEBUG_MODE:
+        app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(farm|herd):"))
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.VOICE, handle_message))
 
