@@ -1,3 +1,4 @@
+import contextlib
 import html
 import json
 import logging
@@ -32,7 +33,8 @@ LITELLM_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "")
 WHISPER_URL = os.getenv("WHISPER_URL", "http://whisper:9000/v1/audio/transcriptions")
 WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")  # `docker exec whisper whisper_manage --getkey`
 LITELLM_URL = os.getenv("LITELLM_URL", "http://litellm:4000/v1/chat/completions")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/postgres")
+DATABASE_URL = os.getenv("DATABASE_URL")  # no default: the fallback was a superuser URL, and owners bypass RLS
+DB_ROLE = os.getenv("DB_ROLE", "speech_sql_user")  # post_init asserts we connect as this role (rls.sql)
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:14b")
 DB_SCHEMA = os.getenv("DB_SCHEMA", "tractor")
 # comma-separated table allowlist to keep the prompt small; empty = all visible tables
@@ -51,14 +53,18 @@ KIMI_API_KEY = os.getenv("KIMI_API_KEY", "")
 KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-k3")
 KIMI_BASE_URL = os.getenv("KIMI_BASE_URL", "https://api.moonshot.ai/anthropic")
 if ANTHROPIC_API_KEY:
-    anthropic_client, LLM_MODEL = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY), ANTHROPIC_MODEL
+    anthropic_client, LLM_MODEL = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=LLM_TIMEOUT), ANTHROPIC_MODEL
 elif KIMI_API_KEY:
-    anthropic_client, LLM_MODEL = anthropic.AsyncAnthropic(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL), KIMI_MODEL
+    anthropic_client, LLM_MODEL = anthropic.AsyncAnthropic(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL,
+                                                           timeout=LLM_TIMEOUT), KIMI_MODEL
 else:
     anthropic_client, LLM_MODEL = None, None
 LLM_BACKEND = "anthropic" if ANTHROPIC_API_KEY else "kimi" if KIMI_API_KEY else "local"
+# One connection pool for Whisper + LiteLLM calls (per-request clients paid a TLS handshake every turn)
+http_client = httpx.AsyncClient(timeout=LLM_TIMEOUT)
 
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
+MAX_ROWS = 1000          # cap fetched rows; a model-emitted cartesian join must not stall the bot
 TELEGRAM_MSG_LIMIT = 4096
 MAX_SQL_ATTEMPTS = 3     # self-correction: model sees SQL errors and retries
 ROUTING_MIN_TABLES = 15  # skip stage-1 table routing for schemas this small
@@ -322,11 +328,12 @@ async def get_db_schema(pool) -> dict:
     return {t: f"Table `{t}`: {', '.join(c)}" for t, c in schema_dict.items()}
 
 async def org_fetch(pool, org_id: str, query: str, *args):
-    """Read-only fetch with the RLS org scope applied."""
+    """Read-only fetch with the RLS org scope applied. Rows capped at MAX_ROWS."""
     async with pool.acquire() as conn:
         async with conn.transaction(readonly=True):
             await conn.execute("SELECT set_config('app.org_id', $1, true)", org_id)
-            return await conn.fetch(query, *args)
+            cur = await conn.cursor(query, *args)
+            return await cur.fetch(MAX_ROWS)
 
 async def execute_sql(pool, sql_query: str, org_id: str, sw: Stopwatch) -> tuple:
     """Run SQL read-only; RLS (see rls.sql) hides rows outside org_id.
@@ -382,7 +389,8 @@ sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show 
                     f"Always answer the user in {LANGUAGES.get(locale, 'English')}.\n"
                     f"{enum_labels_text(locale)}")
     system = [
-        {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral"}},
+        # 1h TTL: the default 5-minute cache almost never hits on a low-traffic bot
+        {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
         {"type": "text", "text": dynamic_text},
     ]
 
@@ -461,7 +469,8 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
     """Orchestrates routing -> LLM -> SQL (with self-correction) -> LLM.
     Returns (reply, last_executed_sql or None)."""
     headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+    # nullcontext: reuse the shared http_client without closing it (closed in post_shutdown)
+    async with contextlib.nullcontext(http_client) as client:
         tables = list(schema_map)
         if len(tables) > ROUTING_MIN_TABLES:
             try:
@@ -710,11 +719,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_voice:
             voice_file = await context.bot.get_file(update.message.voice.file_id)
             voice_bytes = await voice_file.download_as_bytearray()
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(WHISPER_URL, files={"file": ("voice.ogg", bytes(voice_bytes))}, data={"model": "whisper-1"},
-                                      headers={"Authorization": f"Bearer {WHISPER_API_KEY}"} if WHISPER_API_KEY else {})
-                r.raise_for_status()
-                prompt = r.json().get("text", "").strip()
+            r = await http_client.post(WHISPER_URL, files={"file": ("voice.ogg", bytes(voice_bytes))}, data={"model": "whisper-1"},
+                                       headers={"Authorization": f"Bearer {WHISPER_API_KEY}"} if WHISPER_API_KEY else {},
+                                       timeout=120.0)
+            r.raise_for_status()
+            prompt = r.json().get("text", "").strip()
             if not prompt:
                 await status.edit_text("Could not transcribe the voice message.")
                 return
@@ -779,7 +788,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app):
     """Create the pool inside PTB's event loop, cache the schema, set the command menu."""
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5,
+                                     server_settings={"statement_timeout": "30s"})
+    role = await pool.fetchval("SELECT current_user")
+    if role != DB_ROLE:
+        raise RuntimeError(f"DATABASE_URL connects as '{role}', expected '{DB_ROLE}' — "
+                           "table owners bypass RLS, so this would disable tenant isolation (see rls.sql)")
     app.bot_data["db_pool"] = pool
     schema_map = await get_db_schema(pool)
     app.bot_data["db_schema"] = schema_map
@@ -803,11 +817,19 @@ async def post_init(app):
     await app.bot.set_my_commands(commands)
     logger.info("DB pool ready, schema cached.")
 
+async def post_shutdown(app):
+    await http_client.aclose()
+    await app.bot_data["db_pool"].close()
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN")
+    if not DATABASE_URL:
+        raise ValueError("Missing DATABASE_URL")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = (ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
+           .concurrent_updates(True)  # default processes updates one-by-one: one slow query blocked every user
+           .post_init(post_init).post_shutdown(post_shutdown).build())
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("whoami", whoami))
