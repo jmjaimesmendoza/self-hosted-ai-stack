@@ -10,7 +10,7 @@ import anthropic
 import asyncpg
 import httpx
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -83,6 +83,144 @@ FOOTERS = {
     "PT": ("\n\n✅ Consulta concluída — faça outra pergunta ou peça um ajuste.",
            "\n\n💬 Nenhuma consulta foi executada — responda para continuar."),
 }
+
+# All user-facing chrome (the LLM answer itself is localized via LANGUAGES in the prompt).
+STRINGS = {
+    "ES": {
+        "start": "Inicia sesión con tu cuenta: /login <email> <contraseña>",
+        "login_first": "Primero inicia sesión: /login <email> <contraseña>",
+        "login_usage": "Uso: /login <email> <contraseña>",
+        "login_bad": "Credenciales inválidas.",
+        "login_ok": "Sesión iniciada como {name}. Envíame una pregunta (texto o voz).",
+        "delete_warn": "⚠️ No pude borrar tu mensaje — bórralo manualmente para que tu contraseña no quede en el chat.",
+        "busy": "Sigo trabajando en tu pregunta anterior — un momento.",
+        "transcribing": "🎙 Transcribiendo…",
+        "querying": "🔍 Consultando la base de datos…",
+        "running_sql": "📊 Ejecutando la consulta…",
+        "writing": "📝 Redactando la respuesta…",
+        "transcribe_failed": "No pude transcribir el mensaje de voz.",
+        "error": "Algo salió mal con esa pregunta. Puedes decir “intenta de nuevo”, reformularla o acotarla.",
+        "error_generic": "Algo salió mal — inténtalo de nuevo.",
+        "new_chat": "Nueva conversación — las preguntas anteriores quedan olvidadas.",
+        "logged_out": "Sesión cerrada.",
+        "select_farm": "Elige una finca:",
+        "no_farms": "No hay fincas en tu organización.",
+        "all_farms": "🌐 Todas las fincas (sin filtro)",
+        "all_herds": "🌐 Todos los rebaños",
+        "scope_cleared": "Filtro borrado — las preguntas cubren todas las fincas.",
+        "farm_not_found": "Finca no encontrada.",
+        "herd_not_found": "Rebaño no encontrado.",
+        "select_herd": "Finca: {farm}. Elige un rebaño:",
+        "scope_farm_no_herds": "Filtro: finca “{farm}” (no tiene rebaños).",
+        "scope_farm_all_herds": "Filtro: finca “{farm}”, todos los rebaños.",
+        "scope_farm_herd": "Filtro: finca “{farm}”, rebaño “{herd}”.",
+        "session_expired": "Sesión expirada — usa /login de nuevo.",
+        "lang_usage": "Uso: /lang ES | EN | PT",
+        "lang_set": "Idioma cambiado a {lang}.",
+        "help": ("Hazme preguntas sobre tus datos, por texto o nota de voz — por ejemplo:\n"
+                 "• ¿Cuántos animales hay en la finca San Rafael?\n"
+                 "• Peso promedio del rebaño norte este mes\n\n"
+                 "Comandos:\n"
+                 "/login <email> <contraseña> — iniciar sesión\n"
+                 "/farm — filtrar por finca/rebaño\n"
+                 "/new — empezar conversación nueva\n"
+                 "/lang ES|EN|PT — cambiar idioma\n"
+                 "/whoami — ver sesión y filtro\n"
+                 "/logout — cerrar sesión"),
+    },
+    "EN": {
+        "start": "Log in with your account: /login <email> <password>",
+        "login_first": "Please log in first: /login <email> <password>",
+        "login_usage": "Usage: /login <email> <password>",
+        "login_bad": "Invalid credentials.",
+        "login_ok": "Logged in as {name}. Send me a question (text or voice).",
+        "delete_warn": "⚠️ I couldn't delete your message — delete it manually so your password doesn't stay in the chat.",
+        "busy": "Still working on your previous question — one moment.",
+        "transcribing": "🎙 Transcribing…",
+        "querying": "🔍 Querying the database…",
+        "running_sql": "📊 Running the query…",
+        "writing": "📝 Writing the answer…",
+        "transcribe_failed": "Could not transcribe the voice message.",
+        "error": "Something went wrong with that question. You can say “try again”, rephrase it, or narrow it down.",
+        "error_generic": "Something went wrong — please try again.",
+        "new_chat": "New conversation started — previous questions are forgotten.",
+        "logged_out": "Logged out.",
+        "select_farm": "Select a farm:",
+        "no_farms": "No farms found for your organization.",
+        "all_farms": "🌐 All farms (clear scope)",
+        "all_herds": "🌐 All herds",
+        "scope_cleared": "Scope cleared — questions cover all farms.",
+        "farm_not_found": "Farm not found.",
+        "herd_not_found": "Herd not found.",
+        "select_herd": "Farm: {farm}. Select a herd:",
+        "scope_farm_no_herds": "Scope: farm “{farm}” (it has no herds).",
+        "scope_farm_all_herds": "Scope: farm “{farm}”, all herds.",
+        "scope_farm_herd": "Scope: farm “{farm}”, herd “{herd}”.",
+        "session_expired": "Session expired — please /login again.",
+        "lang_usage": "Usage: /lang ES | EN | PT",
+        "lang_set": "Language switched to {lang}.",
+        "help": ("Ask me questions about your data, by text or voice note — for example:\n"
+                 "• How many animals are on the San Rafael farm?\n"
+                 "• Average weight of the north herd this month\n\n"
+                 "Commands:\n"
+                 "/login <email> <password> — log in\n"
+                 "/farm — scope questions to a farm/herd\n"
+                 "/new — start a fresh conversation\n"
+                 "/lang ES|EN|PT — switch language\n"
+                 "/whoami — show session and scope\n"
+                 "/logout — log out"),
+    },
+    "PT": {
+        "start": "Inicie sessão com a sua conta: /login <email> <senha>",
+        "login_first": "Inicie sessão primeiro: /login <email> <senha>",
+        "login_usage": "Uso: /login <email> <senha>",
+        "login_bad": "Credenciais inválidas.",
+        "login_ok": "Sessão iniciada como {name}. Envie-me uma pergunta (texto ou voz).",
+        "delete_warn": "⚠️ Não consegui apagar a sua mensagem — apague-a manualmente para que a senha não fique no chat.",
+        "busy": "Ainda estou na sua pergunta anterior — um momento.",
+        "transcribing": "🎙 Transcrevendo…",
+        "querying": "🔍 Consultando o banco de dados…",
+        "running_sql": "📊 Executando a consulta…",
+        "writing": "📝 Escrevendo a resposta…",
+        "transcribe_failed": "Não consegui transcrever a mensagem de voz.",
+        "error": "Algo deu errado com essa pergunta. Você pode dizer “tente de novo”, reformular ou restringir.",
+        "error_generic": "Algo deu errado — tente novamente.",
+        "new_chat": "Nova conversa — as perguntas anteriores foram esquecidas.",
+        "logged_out": "Sessão encerrada.",
+        "select_farm": "Escolha uma fazenda:",
+        "no_farms": "Nenhuma fazenda na sua organização.",
+        "all_farms": "🌐 Todas as fazendas (sem filtro)",
+        "all_herds": "🌐 Todos os rebanhos",
+        "scope_cleared": "Filtro removido — as perguntas cobrem todas as fazendas.",
+        "farm_not_found": "Fazenda não encontrada.",
+        "herd_not_found": "Rebanho não encontrado.",
+        "select_herd": "Fazenda: {farm}. Escolha um rebanho:",
+        "scope_farm_no_herds": "Filtro: fazenda “{farm}” (não tem rebanhos).",
+        "scope_farm_all_herds": "Filtro: fazenda “{farm}”, todos os rebanhos.",
+        "scope_farm_herd": "Filtro: fazenda “{farm}”, rebanho “{herd}”.",
+        "session_expired": "Sessão expirada — use /login novamente.",
+        "lang_usage": "Uso: /lang ES | EN | PT",
+        "lang_set": "Idioma alterado para {lang}.",
+        "help": ("Faça perguntas sobre os seus dados, por texto ou nota de voz — por exemplo:\n"
+                 "• Quantos animais há na fazenda San Rafael?\n"
+                 "• Peso médio do rebanho norte neste mês\n\n"
+                 "Comandos:\n"
+                 "/login <email> <senha> — iniciar sessão\n"
+                 "/farm — filtrar por fazenda/rebanho\n"
+                 "/new — começar conversa nova\n"
+                 "/lang ES|EN|PT — mudar idioma\n"
+                 "/whoami — ver sessão e filtro\n"
+                 "/logout — encerrar sessão"),
+    },
+}
+
+def get_locale(context) -> str:
+    """Normalized 2-letter locale ('es-ES' -> 'ES'); single ES fallback used everywhere."""
+    loc = (context.user_data.get("locale") or "ES").upper()[:2]
+    return loc if loc in LANGUAGES else "ES"
+
+def t(context, key: str) -> str:
+    return STRINGS[get_locale(context)][key]
 
 # Enum value -> (ES, EN, PT) label, keyed by the column the value comes from.
 # Labels copied from tractor-backend src/shared/constants/enum-labels.const.ts — keep in sync.
@@ -199,13 +337,41 @@ def md_to_html(text: str) -> str:
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.M)
     return text
 
+def chunk_text(text: str, limit: int) -> list:
+    """Split at line boundaries into pieces of at most `limit` chars.
+    ponytail: a single overlong line is hard-sliced; a tag split across
+    chunks falls back to plain text in edit_html."""
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks or [""]
+
 async def edit_html(status, text: str):
-    """Edit the status message rendering Markdown as HTML; plain-text fallback."""
+    """Render Markdown as HTML into the status message; long answers continue
+    in follow-up messages instead of being truncated (footer survives)."""
+    chunks = chunk_text(md_to_html(text), TELEGRAM_MSG_LIMIT)
     try:
-        await status.edit_text(md_to_html(text)[:TELEGRAM_MSG_LIMIT], parse_mode="HTML")
-    except BadRequest:  # e.g. tag cut in half by the length cap
+        await status.edit_text(chunks[0], parse_mode="HTML")
+        for c in chunks[1:]:
+            await status.reply_text(c, parse_mode="HTML")
+    except BadRequest:  # e.g. a tag split across chunks — resend as plain text
         try:
-            await status.edit_text(text[:TELEGRAM_MSG_LIMIT])
+            plain = chunk_text(text, TELEGRAM_MSG_LIMIT)
+            await status.edit_text(plain[0])
+            for c in plain[1:]:
+                await status.reply_text(c)
         except BadRequest:  # e.g. "message is not modified" — nothing left to salvage
             logger.warning("edit_html fallback failed", exc_info=True)
 
@@ -401,7 +567,7 @@ No headers, tables, links, or italics.
 
 async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str,
                                 locale: str, scope: str = "", history: list = None,
-                                sw: Stopwatch = None) -> tuple:
+                                sw: Stopwatch = None, progress=None) -> tuple:
     """SQL generation via the Claude API. Returns (reply, last_executed_sql or None)."""
     # Static block (identical across users/turns) is prompt-cached; the
     # per-user specifics go in a second block after the cache breakpoint.
@@ -425,6 +591,8 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
         )
         if sql_runs >= MAX_SQL_ATTEMPTS:
             kwargs["tool_choice"] = {"type": "none"}  # force a final answer
+        if progress and sql_runs:
+            await progress("writing")  # tool results are in; the model is composing
         sw.lap("bot_llm")
         for retry in range(3):
             try:
@@ -453,6 +621,8 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
         for block in tool_blocks:
             sql_query = block.input.get("sql_query", "")
             executed_sql = sql_query
+            if progress:
+                await progress("running_sql")
             db_result, ok = await execute_sql(pool, sql_query, org_id, sw)
             if not ok:
                 logger.info(f"SQL failed (run {sql_runs + 1}/{MAX_SQL_ATTEMPTS}), Claude will retry")
@@ -476,14 +646,16 @@ async def pick_tables(client, headers, question: str, table_names: list) -> list
     return [t for t in table_names if re.search(rf"\b{re.escape(t)}\b", text)]
 
 async def query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str,
-                         scope: str = "", history: list = None, sw: Stopwatch = None) -> tuple:
+                         scope: str = "", history: list = None, sw: Stopwatch = None,
+                         progress=None) -> tuple:
     """Dispatch to the Claude API when a key is configured, else local LiteLLM."""
     if anthropic_client:
-        return await claude_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history, sw)
-    return await litellm_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history, sw)
+        return await claude_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history, sw, progress)
+    return await litellm_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history, sw, progress)
 
 async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str,
-                                 scope: str = "", history: list = None, sw: Stopwatch = None) -> tuple:
+                                 scope: str = "", history: list = None, sw: Stopwatch = None,
+                                 progress=None) -> tuple:
     """Orchestrates routing -> LLM -> SQL (with self-correction) -> LLM.
     Returns (reply, last_executed_sql or None)."""
     headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"}
@@ -529,6 +701,8 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
             if message.get("tool_calls"):
                 tool_call = message["tool_calls"][0]
                 sql_query = json.loads(tool_call["function"]["arguments"]).get("sql_query", "")
+                if progress:
+                    await progress("running_sql")
                 db_result, ok = await execute_sql(pool, sql_query, org_id, sw)
                 messages.extend([message, {"role": "tool", "tool_call_id": tool_call["id"], "content": db_result}])
             else:
@@ -540,6 +714,8 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
                     return content or "No response generated.", executed_sql
                 logger.info("Salvaged inline tool call from text response")
                 sql_query = json.loads(m.group(1))
+                if progress:
+                    await progress("running_sql")
                 db_result, ok = await execute_sql(pool, sql_query, org_id, sw)
                 messages.extend([{"role": "assistant", "content": content},
                                  {"role": "user", "content": f"Query result: {db_result}"}])
@@ -555,6 +731,8 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
 
         messages.append({"role": "user", "content": "Answer the original question using the query results, "
                                                     f"in {LANGUAGES.get(locale, 'English')}."})
+        if progress:
+            await progress("writing")
         sw.lap("bot_llm")
         final_resp = await client.post(LITELLM_URL, json={"model": MODEL_NAME, "messages": messages,
                                                           "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS}, headers=headers)
@@ -566,21 +744,32 @@ async def require_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Return org_id, or None after telling the user to log in."""
     org_id = context.user_data.get("org_id")
     if not org_id:
-        await update.effective_message.reply_text("Please log in first: /login <email> <password>")
+        await update.effective_message.reply_text(t(context, "login_first"))
     return org_id
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Log in with your account: /login <email> <password>")
+    await update.message.reply_text(t(context, "start"))
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(t(context, "help"))
+
+async def lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = (context.args[0] if context.args else "").upper()[:2]
+    if arg not in LANGUAGES:
+        await update.message.reply_text(t(context, "lang_usage"))
+        return
+    context.user_data["locale"] = arg
+    await update.message.reply_text(t(context, "lang_set").format(lang=LANGUAGES[arg]))
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Authenticate against the app's users table (argon2)."""
     try:
         await update.message.delete()  # don't leave the password in chat history
     except Exception:
-        pass
+        await update.effective_chat.send_message(t(context, "delete_warn"))
     chat = update.effective_chat
     if len(context.args) != 2:
-        await chat.send_message("Usage: /login <email> <password>")
+        await chat.send_message(t(context, "login_usage"))
         return
 
     email, password = context.args
@@ -597,11 +786,11 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             hasher.verify(row["password"], password)
             verified = True
-        except VerifyMismatchError:
-            pass
+        except (VerifyMismatchError, InvalidHashError, TypeError):
+            pass  # wrong password, or a NULL/non-argon2 hash (SSO / invited user)
     if not verified:
         logger.warning(f"Failed login attempt for {email} (tg user {update.effective_user.id})")
-        await chat.send_message("Invalid credentials.")
+        await chat.send_message(t(context, "login_bad"))
         return
     logger.info(f"Login: {email} (tg user {update.effective_user.id})")
 
@@ -611,7 +800,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["name"] = row["name"]
     context.user_data["email"] = email
     context.user_data["locale"] = row["locale"]
-    await chat.send_message(f"Logged in as {row['name']}. Send me a question (text or voice).")
+    await chat.send_message(t(context, "login_ok").format(name=row["name"]))
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_login(update, context):
@@ -635,11 +824,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("history", None)
-    await update.message.reply_text("New conversation started — previous questions are forgotten.")
+    await update.message.reply_text(t(context, "new_chat"))
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = t(context, "logged_out")  # read the locale before clear() wipes it
     context.user_data.clear()
-    await update.message.reply_text("Logged out.")
+    await update.message.reply_text(msg)
 
 async def farm_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Pick a farm (then a herd) to auto-scope all questions."""
@@ -649,11 +839,11 @@ async def farm_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await org_fetch(context.bot_data["db_pool"], org_id,
                            "SELECT id, name FROM farms WHERE is_deleted = false ORDER BY name")
     if not rows:
-        await update.message.reply_text("No farms found for your organization.")
+        await update.message.reply_text(t(context, "no_farms"))
         return
     keyboard = [[InlineKeyboardButton(r["name"], callback_data=f"farm:{r['id']}")] for r in rows]
-    keyboard.append([InlineKeyboardButton("🌐 All farms (clear scope)", callback_data="farm:all")])
-    await update.message.reply_text("Select a farm:", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard.append([InlineKeyboardButton(t(context, "all_farms"), callback_data="farm:all")])
+    await update.message.reply_text(t(context, "select_farm"), reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle farm/herd button presses."""
@@ -661,7 +851,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     org_id = context.user_data.get("org_id")
     if not org_id:
-        await q.edit_message_text("Session expired — please /login again.")
+        await q.edit_message_text(t(context, "session_expired"))
         return
     pool = context.bot_data["db_pool"]
     kind, val = q.data.split(":", 1)
@@ -670,34 +860,35 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("herd", None)
         if val == "all":
             context.user_data.pop("farm", None)
-            await q.edit_message_text("Scope cleared — questions cover all farms.")
+            await q.edit_message_text(t(context, "scope_cleared"))
             return
         rows = await org_fetch(pool, org_id, "SELECT name FROM farms WHERE id = $1", val)
         if not rows:
-            await q.edit_message_text("Farm not found.")
+            await q.edit_message_text(t(context, "farm_not_found"))
             return
         context.user_data["farm"] = {"id": val, "name": rows[0]["name"]}
         herds = await org_fetch(pool, org_id,
                                 "SELECT id, name FROM herds WHERE farm_id = $1 AND is_deleted = false ORDER BY name", val)
         if not herds:
-            await q.edit_message_text(f"Scope: farm “{rows[0]['name']}” (it has no herds).")
+            await q.edit_message_text(t(context, "scope_farm_no_herds").format(farm=rows[0]["name"]))
             return
         keyboard = [[InlineKeyboardButton(h["name"], callback_data=f"herd:{h['id']}")] for h in herds]
-        keyboard.append([InlineKeyboardButton("🌐 All herds", callback_data="herd:all")])
-        await q.edit_message_text(f"Farm: {rows[0]['name']}. Select a herd:",
+        keyboard.append([InlineKeyboardButton(t(context, "all_herds"), callback_data="herd:all")])
+        await q.edit_message_text(t(context, "select_herd").format(farm=rows[0]["name"]),
                                   reply_markup=InlineKeyboardMarkup(keyboard))
     elif kind == "herd":
         farm = context.user_data.get("farm")
         if val == "all" or not farm:
             context.user_data.pop("herd", None)
-            await q.edit_message_text(f"Scope: farm “{farm['name']}”, all herds." if farm else "Scope cleared.")
+            await q.edit_message_text(t(context, "scope_farm_all_herds").format(farm=farm["name"])
+                                      if farm else t(context, "scope_cleared"))
             return
         rows = await org_fetch(pool, org_id, "SELECT name FROM herds WHERE id = $1", val)
         if not rows:
-            await q.edit_message_text("Herd not found.")
+            await q.edit_message_text(t(context, "herd_not_found"))
             return
         context.user_data["herd"] = {"id": val, "name": rows[0]["name"]}
-        await q.edit_message_text(f"Scope: farm “{farm['name']}”, herd “{rows[0]['name']}”.")
+        await q.edit_message_text(t(context, "scope_farm_herd").format(farm=farm["name"], herd=rows[0]["name"]))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generic handler for text/voice."""
@@ -706,7 +897,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if context.user_data.get("busy"):
-        await update.message.reply_text("Still working on your previous question — one moment.")
+        await update.message.reply_text(t(context, "busy"))
         return
     context.user_data["busy"] = True
 
@@ -715,7 +906,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = None  # created inside the try so a failed send can't leak busy=True
     try:
         # one status message, edited in place as stages complete
-        status = await update.message.reply_text("🎙 Transcribing…" if is_voice else "🔍 Querying the database…")
+        status = await update.message.reply_text(t(context, "transcribing" if is_voice else "querying"))
         echo, prompt = "", ""
         if is_voice:
             voice_file = await context.bot.get_file(update.message.voice.file_id)
@@ -726,10 +917,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r.raise_for_status()
             prompt = r.json().get("text", "").strip()
             if not prompt:
-                await status.edit_text("Could not transcribe the voice message.")
+                await status.edit_text(t(context, "transcribe_failed"))
                 return
-            echo = f"🗣 You asked: {prompt}\n\n"
-            await status.edit_text(f"{echo}🔍 Querying the database…")
+            echo = f"🗣 {prompt}\n\n"
+            await status.edit_text(f"{echo}{t(context, 'querying')}")
         else:
             prompt = update.message.text
         logger.info(f"Q [{context.user_data.get('email')}{' voice' if is_voice else ''}]: {prompt}")
@@ -744,17 +935,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       "scope to this herd unless told otherwise.")
         if DEBUG_MODE:
             await update.effective_message.reply_text(f"🔧 LLM: {LLM_BACKEND} ({LLM_MODEL or 'litellm'})")
+
+        async def progress(key):  # per-stage status edits close minutes-long silent gaps
+            try:
+                await status.edit_text(echo + t(context, key))
+            except Exception:
+                pass
+
         sw = Stopwatch()  # ponytail: always runs; laps are ~ns, gating only at report time
         reply, executed_sql = await query_pipeline(prompt, pool, context.bot_data["db_schema"], org_id,
-                                                   context.user_data.get("locale") or "ES", scope,
-                                                   context.user_data.get("history"), sw)
+                                                   get_locale(context), scope,
+                                                   context.user_data.get("history"), sw, progress)
         if reply:
             history = context.user_data.setdefault("history", [])
             history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": reply}]
             del history[:-HISTORY_MAX]
         if DEBUG_MODE and executed_sql:
             reply = f"{reply or ''}\n\n🔧 SQL:\n```sql\n{executed_sql}\n```"
-        footer = FOOTERS.get(context.user_data.get("locale") or "ES", FOOTERS["ES"])[0 if executed_sql else 1]
+        footer = FOOTERS[get_locale(context)][0 if executed_sql else 1]
         await edit_html(status, echo + (reply or "No response generated.") + footer)
         sw.lap("format")
         if DEBUG_MODE:
@@ -783,8 +981,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # repr(): timeouts and friends often have an empty str()
                 await status.edit_text(f"⚠️ DEBUG ERROR: {e!r}"[:TELEGRAM_MSG_LIMIT])
             else:
-                await status.edit_text("Something went wrong with that question. "
-                                       "You can say “try again”, rephrase it, or narrow it down.")
+                await status.edit_text(t(context, "error"))
     finally:
         context.user_data["busy"] = False
 
@@ -813,6 +1010,8 @@ async def post_init(app):
         BotCommand("login", "Log in: /login <email> <password>"),
         BotCommand("farm", "Choose the farm/herd your questions are about"),
         BotCommand("new", "Start a new conversation (forget previous questions)"),
+        BotCommand("lang", "Switch language: /lang ES|EN|PT"),
+        BotCommand("help", "How to use the bot, with examples"),
         BotCommand("whoami", "Show who is logged in and current scope"),
         BotCommand("logout", "Log out"),
     ]
@@ -831,7 +1030,7 @@ async def on_error(update, context):
     msg = getattr(update, "effective_message", None)
     if msg:
         try:
-            await msg.reply_text("Something went wrong — please try again.")
+            await msg.reply_text(t(context, "error_generic"))
         except Exception:
             pass
 
@@ -850,7 +1049,9 @@ def main():
            .persistence(persistence)
            .post_init(post_init).post_shutdown(post_shutdown).build())
     app.add_error_handler(on_error)
-    app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("lang", lang))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("new", new_conversation))
