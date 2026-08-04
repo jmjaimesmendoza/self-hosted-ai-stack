@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import httpx
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -151,6 +153,23 @@ def enum_labels_text(locale: str) -> str:
              for col, vals in ENUM_GLOSSARY.items()]
     return ("ENUM LABELS — in your answer never show raw enum codes; "
             "use these labels instead:\n" + "\n".join(lines))
+
+def md_to_html(text: str) -> str:
+    """Telegram-safe HTML from the simple Markdown subset the model emits.
+    Everything is escaped first, so unmatched markers can never break the send."""
+    text = html.escape(text)
+    text = re.sub(r"```\w*\n(.*?)```", r"<pre>\1</pre>", text, flags=re.S)
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.M)
+    return text
+
+async def edit_html(status, text: str):
+    """Edit the status message rendering Markdown as HTML; plain-text fallback."""
+    try:
+        await status.edit_text(md_to_html(text)[:TELEGRAM_MSG_LIMIT], parse_mode="HTML")
+    except BadRequest:  # e.g. tag cut in half by the length cap
+        await status.edit_text(text[:TELEGRAM_MSG_LIMIT])
 
 hasher = PasswordHasher()
 
@@ -443,6 +462,8 @@ now with the tool, or ask your clarifying question. Your reply ends the turn.
 {GROUNDING}
 In your answer, format dates like 15/03/2024 (no timestamps unless asked), round decimals
 sensibly (e.g. 512.5 kg, ages as whole years), and never show UUIDs.
+Format answers in simple Markdown only: **bold**, `code`, and "- " bullet lists.
+No headers, tables, links, or italics.
 Always answer the user in {LANGUAGES.get(locale, "English")}.
 {enum_labels_text(locale)}
 {FEW_SHOTS}{" /no_think" if NO_THINK else ""}"""
@@ -673,9 +694,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": reply}]
             del history[:-HISTORY_MAX]
         if DEBUG_MODE and executed_sql:
-            reply = f"{reply or ''}\n\n🔧 SQL:\n{executed_sql}"
+            reply = f"{reply or ''}\n\n🔧 SQL:\n```sql\n{executed_sql}\n```"
         footer = FOOTERS.get(context.user_data.get("locale") or "ES", FOOTERS["ES"])[0 if executed_sql else 1]
-        await status.edit_text((echo + (reply or "No response generated.") + footer)[:TELEGRAM_MSG_LIMIT])
+        await edit_html(status, echo + (reply or "No response generated.") + footer)
 
     except Exception as e:
         logger.exception("Handler Error")
