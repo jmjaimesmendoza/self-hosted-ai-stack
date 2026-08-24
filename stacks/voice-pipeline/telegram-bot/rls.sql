@@ -18,8 +18,10 @@
 --   2. Other tables get an EXISTS policy hopping one FK to an already-scoped
 --      parent; Postgres applies RLS recursively, so chains like
 --      details -> events -> persons -> org resolve automatically.
---   3. Leftovers with no org path are denied, except a whitelist of global
---      reference tables (countries, breeds, ...).
+--   3. Leftovers with no org path stay readable as global reference data
+--      (countries, breeds, catalogs, ...) — except always_deny, which is
+--      revoked. Global means every org reads the same rows, so anything
+--      tenant-sensitive that lands here belongs in always_deny.
 -- The backend is unaffected: it connects as the table owner, which bypasses
 -- non-FORCE RLS, and all policies are TO speech_sql_user only.
 
@@ -46,6 +48,7 @@ DECLARE
   cond text;
   policied text[] := ARRAY[]::text[];
   denied text[] := ARRAY[]::text[];
+  global_extra text[] := ARRAY[]::text[];
   -- global reference tables: readable by every org, no RLS needed
   allowed_global text[] := ARRAY[
     'countries', 'cattle_breeds', 'variables', 'farm_variables',
@@ -147,7 +150,10 @@ BEGIN
     EXIT WHEN NOT progress;
   END LOOP;
 
-  -- Deny everything without an org path (plus the explicit deny list)
+  -- Leftovers have no org path. Keep them readable as global reference data —
+  -- the GRANT from the first loop stands, which is also what makes re-running
+  -- this script resurrect tables an older version had revoked. Only always_deny
+  -- is taken back.
   FOR r IN
     SELECT c.relname AS tbl FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -155,14 +161,20 @@ BEGIN
       AND c.relname <> ALL (policied)
       AND c.relname <> ALL (allowed_global)
   LOOP
-    BEGIN
-      EXECUTE format('REVOKE SELECT ON tractor.%I FROM speech_sql_user', r.tbl);
-      denied := denied || r.tbl;
-    EXCEPTION WHEN OTHERS THEN NULL;
-    END;
+    IF r.tbl = ANY (always_deny) THEN
+      BEGIN
+        EXECUTE format('REVOKE SELECT ON tractor.%I FROM speech_sql_user', r.tbl);
+        denied := denied || r.tbl;
+      EXCEPTION WHEN OTHERS THEN NULL;
+      END;
+    ELSE
+      global_extra := global_extra || r.tbl;
+    END IF;
   END LOOP;
 
   RAISE NOTICE 'org-scoped tables: %', array_to_string(policied, ', ');
+  -- audit this list: every org reads these rows. Move anything sensitive into always_deny.
+  RAISE NOTICE 'global (no org path): %', array_to_string(global_extra, ', ');
   RAISE NOTICE 'denied tables: %', array_to_string(denied, ', ');
 END $$;
 

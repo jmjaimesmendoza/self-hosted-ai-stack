@@ -349,7 +349,7 @@ def chunk_text(text: str, limit: int) -> list:
                 cur = ""
             chunks.append(line[:limit])
             line = line[limit:]
-        if len(cur) + len(line) + 1 > limit:
+        if cur and len(cur) + len(line) + 1 > limit:
             chunks.append(cur)
             cur = line
         else:
@@ -484,21 +484,78 @@ RUN_SQL_TOOL = {
     },
 }
 
+# information_schema gives names and types but not joins, and reports every enum as
+# "USER-DEFINED" — the model then guesses both. These fill in the two gaps.
+COLUMNS_SQL = """
+    SELECT table_name, column_name, data_type, udt_schema, udt_name
+    FROM information_schema.columns
+    WHERE table_schema = $1
+      AND ($2::text[] IS NULL OR table_name = ANY($2))
+    ORDER BY table_name, ordinal_position;
+"""
+# same conkey/confkey unnest as rls.sql's FK hop; pg_catalog is not privilege-filtered,
+# so format_schema drops references to tables the role can't see
+FKS_SQL = """
+    SELECT c.relname AS tbl, a.attname AS col,
+           pc.relname AS ref_tbl, pa.attname AS ref_col
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_class pc ON pc.oid = con.confrelid
+    JOIN unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord) ON true
+    JOIN unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON fk.ord = ck.ord
+    JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ck.attnum
+    JOIN pg_attribute pa ON pa.attrelid = con.confrelid AND pa.attnum = fk.attnum
+    WHERE n.nspname = $1 AND con.contype = 'f';
+"""
+# keyed by (schema, name): a same-named enum in another schema must not merge labels
+ENUMS_SQL = """
+    SELECT n.nspname AS schema, t.typname AS name, e.enumlabel AS label
+    FROM pg_type t
+    JOIN pg_enum e ON e.enumtypid = t.oid
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    ORDER BY t.typname, e.enumsortorder;
+"""
+
+def format_schema(columns: list, fks: list, enums: list) -> dict:
+    """{table_name: one-line description}, with enum values and FK targets inlined.
+
+    e.g. Table `animals`: sex (AnimalSex: MALE|FEMALE), farm_id (text -> farms.id)"""
+    labels = {}
+    for row in enums:
+        labels.setdefault((row["schema"], row["name"]), []).append(row["label"])
+
+    tables = {}
+    for row in columns:
+        tables.setdefault(row["table_name"], {})[row["column_name"]] = row
+
+    targets = {(f["tbl"], f["col"]): f"{f['ref_tbl']}.{f['ref_col']}" for f in fks
+               if f["tbl"] in tables and f["ref_tbl"] in tables}
+
+    out = {}
+    for table, cols in tables.items():
+        parts = []
+        for name, row in cols.items():
+            kind = row["data_type"]
+            if kind == "USER-DEFINED":
+                kind = row["udt_name"]
+                values = labels.get((row["udt_schema"], row["udt_name"]))
+                if values:
+                    kind = f"{kind}: {'|'.join(values)}"
+            elif kind == "ARRAY":
+                kind = row["udt_name"].lstrip("_") + "[]"
+            ref = targets.get((table, name))
+            parts.append(f"{name} ({kind}{' -> ' + ref if ref else ''})")
+        out[table] = f"Table `{table}`: {', '.join(parts)}"
+    return out
+
 async def get_db_schema(pool) -> dict:
-    """Fetch schema as {table_name: one-line description}."""
-    query = """
-        SELECT table_name, column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema = $1
-          AND ($2::text[] IS NULL OR table_name = ANY($2))
-        ORDER BY table_name, ordinal_position;
-    """
+    """Fetch schema as {table_name: one-line description}. Startup only."""
     async with pool.acquire() as conn:
-        rows = await conn.fetch(query, DB_SCHEMA, SCHEMA_TABLES or None)
-    schema_dict = {}
-    for row in rows:
-        schema_dict.setdefault(row["table_name"], []).append(f"{row['column_name']} ({row['data_type']})")
-    return {t: f"Table `{t}`: {', '.join(c)}" for t, c in schema_dict.items()}
+        columns = await conn.fetch(COLUMNS_SQL, DB_SCHEMA, SCHEMA_TABLES or None)
+        fks = await conn.fetch(FKS_SQL, DB_SCHEMA)
+        enums = await conn.fetch(ENUMS_SQL)
+    return format_schema(columns, fks, enums)
 
 async def org_fetch(pool, org_id: str, query: str, *args):
     """Read-only fetch with the RLS org scope applied. Rows capped at MAX_ROWS."""
@@ -508,6 +565,22 @@ async def org_fetch(pool, org_id: str, query: str, *args):
             cur = await conn.cursor(query, *args)
             return await cur.fetch(MAX_ROWS)
 
+def shrink_result(rows: list) -> str:
+    """JSON payload for the model. Notes the MAX_ROWS cap (the true total is unknown
+    past it), drops whole rows to fit MAX_RESULT_CHARS, and char-slices only when a
+    single row alone exceeds the budget (readable values beat an empty result)."""
+    capped = len(rows) == MAX_ROWS
+    total = f"at least {MAX_ROWS}" if capped else str(len(rows))
+    kept = [dict(r) for r in rows]
+    note = [f"(row cap reached: showing the first {MAX_ROWS} matching rows)"] if capped else []
+    result = json.dumps(kept + note, default=str)
+    while len(result) > MAX_RESULT_CHARS and len(kept) > 1:
+        kept = kept[: len(kept) // 2]
+        result = json.dumps(kept + [f"(truncated, showing {len(kept)} of {total} rows)"], default=str)
+    if len(result) > MAX_RESULT_CHARS:
+        result = result[:MAX_RESULT_CHARS] + " … (row truncated)"
+    return result
+
 async def execute_sql(pool, sql_query: str, org_id: str, sw: Stopwatch) -> tuple:
     """Run SQL read-only; RLS (see rls.sql) hides rows outside org_id.
     Returns (result_json, ok)."""
@@ -516,12 +589,7 @@ async def execute_sql(pool, sql_query: str, org_id: str, sw: Stopwatch) -> tuple
     try:
         rows = await org_fetch(pool, org_id, sql_query)
         logger.info(f"SQL result: {len(rows)} rows")
-        kept = [dict(row) for row in rows]
-        result = json.dumps(kept, default=str)
-        # drop whole rows until it fits — a mid-string char slice handed the model broken JSON
-        while len(result) > MAX_RESULT_CHARS and kept:
-            kept = kept[: len(kept) // 2]
-            result = json.dumps(kept + [f"(truncated, showing {len(kept)} of {len(rows)} rows)"], default=str)
+        result = shrink_result(rows)
         sw.lap("db")
         return result, True
     except Exception as e:
@@ -540,16 +608,25 @@ def build_prompts(schema: str, org_id: str, scope: str, locale: str) -> tuple:
     """(static, dynamic) system-prompt blocks shared by both pipelines.
     static is byte-stable across users/turns so the Claude path can prompt-cache it;
     the LiteLLM path concatenates both into one system message."""
-    static = f"""You are an AI with access to a PostgreSQL database.
-DATABASE SCHEMA:
+    static = f"""You are a helpful assistant for the users of a farm-management system,
+with read access to its PostgreSQL database. You hold a normal conversation and you
+answer questions from the data.
+DATABASE SCHEMA (a column shown as `x -> y.z` is a foreign key; an enum column lists
+its allowed values):
 {schema}
-This is a multi-tenant database. Every query MUST filter by the current user's
-organization_id (given below), directly or via a join to a table that has it.
+Most tables are multi-tenant: a query touching them MUST filter by the current user's
+organization_id (given below), directly or via a join to a table that has it. A table
+with no organization_id and no join path to one is global reference data — query it
+directly, do not invent a scope for it.
 Rows with is_deleted = true must be excluded.
 All ids are UUIDs — NEVER guess an id from a name. When the user mentions a farm,
 herd, animal, or person by name, match it with a join and ILIKE (e.g.
 JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
-Construct a valid SELECT query and use the 'run_sql_query' tool. NEVER use destructive queries.
+When the question needs data, construct a valid SELECT query and use the
+'run_sql_query' tool. NEVER use destructive queries. When it doesn't need data — a
+greeting, a thank-you, asking what you can do, explaining what a field or a metric
+means, or discussing a result you already fetched — just reply in plain language, no
+tool call.
 If the question is ambiguous or missing information you need (which farm, which period,
 which animals), ask a short clarifying question instead of guessing.
 Never announce that you are going to look something up or run a query — either run it
@@ -559,7 +636,9 @@ In your answer, format dates like 15/03/2024 (no timestamps unless asked), round
 sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show UUIDs.
 Format answers in simple Markdown only: **bold**, `code`, and "- " bullet lists.
 No headers, tables, links, or italics.
-{FEW_SHOTS}"""
+{FEW_SHOTS}
+Those are examples of SQL style, not a limit on which tables or topics you can cover —
+use any table in the schema above."""
     dynamic = (f"The current user's organization_id is '{org_id}'.{scope}\n"
                f"Always answer the user in {LANGUAGES.get(locale, 'English')}.\n"
                f"{enum_labels_text(locale)}")
@@ -795,6 +874,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Login: {email} (tg user {update.effective_user.id})")
 
     context.user_data.pop("history", None)  # fresh session, fresh conversation
+    context.user_data["epoch"] = context.user_data.get("epoch", 0) + 1  # invalidate in-flight write-backs
     context.user_data["org_id"] = row["organization_id"]
     context.user_data["db_user_id"] = row["id"]
     context.user_data["name"] = row["name"]
@@ -824,6 +904,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("history", None)
+    context.user_data["epoch"] = context.user_data.get("epoch", 0) + 1  # invalidate in-flight write-backs
     await update.message.reply_text(t(context, "new_chat"))
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -903,11 +984,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pool = context.bot_data["db_pool"]
     is_voice = bool(update.message.voice)
+    epoch = context.user_data.setdefault("epoch", 0)  # bumped by /login and /new; gone after /logout
     status = None  # created inside the try so a failed send can't leak busy=True
+    echo, prompt = "", ""  # before the send: the except block reads prompt
     try:
         # one status message, edited in place as stages complete
         status = await update.message.reply_text(t(context, "transcribing" if is_voice else "querying"))
-        echo, prompt = "", ""
         if is_voice:
             voice_file = await context.bot.get_file(update.message.voice.file_id)
             voice_bytes = await voice_file.download_as_bytearray()
@@ -946,7 +1028,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply, executed_sql = await query_pipeline(prompt, pool, context.bot_data["db_schema"], org_id,
                                                    get_locale(context), scope,
                                                    context.user_data.get("history"), sw, progress)
-        if reply:
+        # skip the write-back if /login, /new or /logout ran while we awaited the LLM —
+        # concurrent_updates means this turn may belong to a session that no longer exists
+        if reply and context.user_data.get("epoch") == epoch:
             history = context.user_data.setdefault("history", [])
             history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": reply}]
             del history[:-HISTORY_MAX]
@@ -957,11 +1041,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sw.lap("format")
         if DEBUG_MODE:
             try:  # the answer is already delivered — a failed report must not reach the outer except
-                avg = context.user_data.setdefault("timings_avg", {})
-                for k, v in sw.d.items():
-                    if v:
-                        s, n = avg.get(k, (0.0, 0))
-                        avg[k] = (s + sum(v), n + 1)
+                if context.user_data.get("epoch") == epoch:
+                    avg = context.user_data.setdefault("timings_avg", {})
+                    for k, v in sw.d.items():
+                        if v:
+                            s, n = avg.get(k, (0.0, 0))
+                            avg[k] = (s + sum(v), n + 1)
                 await update.effective_message.reply_text(f"<pre>⏱\n{fmt_timings(sw.d)}</pre>", parse_mode="HTML")
             except Exception:
                 logger.exception("Timing report failed")
@@ -969,7 +1054,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Handler Error")
         # record the failed turn so "try again" or a rephrase keeps its context
-        if prompt:
+        if prompt and context.user_data.get("epoch") == epoch:
             history = context.user_data.setdefault("history", [])
             history += [{"role": "user", "content": prompt},
                         {"role": "assistant",
@@ -983,7 +1068,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await status.edit_text(t(context, "error"))
     finally:
-        context.user_data["busy"] = False
+        context.user_data.pop("busy", None)  # pop, not =False: never repopulate a dict /logout cleared
 
 async def post_init(app):
     """Create the pool inside PTB's event loop, cache the schema, set the command menu."""
@@ -996,6 +1081,8 @@ async def post_init(app):
     app.bot_data["db_pool"] = pool
     schema_map = await get_db_schema(pool)
     app.bot_data["db_schema"] = schema_map
+    # a low count means a stale rls.sql or a stray SCHEMA_TABLES, not a bad model
+    logger.info(f"Schema: {len(schema_map)} tables visible in '{DB_SCHEMA}'")
     for ud in app.user_data.values():  # a crash mid-request must not persist a stuck busy flag
         ud.pop("busy", None)
     total = sum(len(v) for v in schema_map.values())
@@ -1022,7 +1109,9 @@ async def post_init(app):
 
 async def post_shutdown(app):
     await http_client.aclose()
-    await app.bot_data["db_pool"].close()
+    pool = app.bot_data.get("db_pool")  # absent when post_init aborted (e.g. the DB-role assert)
+    if pool:
+        await pool.close()
 
 async def on_error(update, context):
     """Last-resort handler: most command handlers have no try/except of their own."""
