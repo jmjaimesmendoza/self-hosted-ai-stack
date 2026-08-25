@@ -23,6 +23,7 @@ COLUMNS = [
     col("animals", "farm_id", "text"),
     col("animals", "secret_id", "text"),
     col("farms", "id", "text"),
+    col("farms", "owner_sex", "USER-DEFINED", "AnimalSex"),
 ]
 FKS = [
     {"tbl": "animals", "col": "farm_id", "ref_tbl": "farms", "ref_col": "id"},
@@ -48,6 +49,10 @@ assert "secret_id (text)" in animals, animals               # FK to invisible ta
 assert "user_tokens" not in animals, animals
 assert "tags (text[])" in animals, animals                  # array rendered readably
 assert "id (text)," in animals, animals                     # plain column unchanged
+
+# values listed once: the second column using AnimalSex gets the bare type name
+assert "owner_sex (AnimalSex)" in out["farms"], out["farms"]
+assert "MALE" not in out["farms"], out["farms"]
 
 # no enum metadata at all: fall back to the bare type name, don't crash
 assert "sex (AnimalSex)" in format_schema(COLUMNS, [], [])["animals"]

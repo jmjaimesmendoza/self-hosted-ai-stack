@@ -521,7 +521,11 @@ ENUMS_SQL = """
 def format_schema(columns: list, fks: list, enums: list) -> dict:
     """{table_name: one-line description}, with enum values and FK targets inlined.
 
-    e.g. Table `animals`: sex (AnimalSex: MALE|FEMALE), farm_id (text -> farms.id)"""
+    e.g. Table `animals`: sex (AnimalSex: MALE|FEMALE), farm_id (text -> farms.id)
+
+    ponytail: an enum's values are listed on its first use only — repeating them in
+    every table that uses the type was the bulk of the prompt; the type name links
+    later columns back to that one listing."""
     labels = {}
     for row in enums:
         labels.setdefault((row["schema"], row["name"]), []).append(row["label"])
@@ -534,14 +538,17 @@ def format_schema(columns: list, fks: list, enums: list) -> dict:
                if f["tbl"] in tables and f["ref_tbl"] in tables}
 
     out = {}
+    listed = set()
     for table, cols in tables.items():
         parts = []
         for name, row in cols.items():
             kind = row["data_type"]
             if kind == "USER-DEFINED":
+                key = (row["udt_schema"], row["udt_name"])
                 kind = row["udt_name"]
-                values = labels.get((row["udt_schema"], row["udt_name"]))
-                if values:
+                values = labels.get(key)
+                if values and key not in listed:
+                    listed.add(key)
                     kind = f"{kind}: {'|'.join(values)}"
             elif kind == "ARRAY":
                 kind = row["udt_name"].lstrip("_") + "[]"
@@ -607,8 +614,9 @@ CLAUDE_SQL_TOOL = {
 
 def build_prompts(schema: str, org_id: str, scope: str, locale: str) -> tuple:
     """(static, dynamic) system-prompt blocks shared by both pipelines.
-    static is byte-stable across users/turns so the Claude path can prompt-cache it;
-    the LiteLLM path concatenates both into one system message."""
+    static is byte-stable per locale so the Claude path can prompt-cache it (one cache
+    entry per language); only org_id and scope vary per user, and they go in dynamic.
+    The LiteLLM path concatenates both into one system message."""
     static = f"""You are a helpful assistant for the users of a farm-management system,
 with read access to its PostgreSQL database. You hold a normal conversation and you
 answer questions from the data.
@@ -639,10 +647,10 @@ Format answers in simple Markdown only: **bold**, `code`, and "- " bullet lists.
 No headers, tables, links, or italics.
 {FEW_SHOTS}
 Those are examples of SQL style, not a limit on which tables or topics you can cover —
-use any table in the schema above."""
-    dynamic = (f"The current user's organization_id is '{org_id}'.{scope}\n"
-               f"Always answer the user in {LANGUAGES.get(locale, 'English')}.\n"
-               f"{enum_labels_text(locale)}")
+use any table in the schema above.
+Always answer the user in {LANGUAGES.get(locale, 'English')}.
+{enum_labels_text(locale)}"""
+    dynamic = f"The current user's organization_id is '{org_id}'.{scope}"
     return static, dynamic
 
 async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str,
@@ -758,6 +766,9 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
                 if t in schema_map and t not in picked:
                     picked.append(t)
             if picked:
+                # ponytail: format_schema lists each enum's values on its first use, so a
+                # routed-away table can take them with it — acceptable on the local path,
+                # where ENUM_GLOSSARY still names the values that matter
                 logger.info(f"Routing: {len(picked)}/{len(tables)} tables: {', '.join(picked)}")
                 tables = picked
         static_text, dynamic_text = build_prompts("\n".join(schema_map[t] for t in tables),
