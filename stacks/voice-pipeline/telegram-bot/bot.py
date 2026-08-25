@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 
 import anthropic
 import asyncpg
@@ -81,6 +82,12 @@ MAX_SQL_ATTEMPTS = 3     # self-correction: model sees SQL errors and retries
 ROUTING_MIN_TABLES = 15  # skip stage-1 table routing for schemas this small
 HISTORY_MAX = 10         # messages kept per user (5 exchanges) for follow-up questions
 LANGUAGES = {"ES": "Spanish", "EN": "English", "PT": "Portuguese"}
+# The system prompt lives in prompt.md so it can be tuned without touching Python.
+# Read once at import: byte-stable text is what makes the 1h prompt cache hit, and a
+# missing file should fail at startup, not mid-conversation. rstrip so an editor
+# adding or dropping the trailing newline cannot silently invalidate that cache.
+# NOTE: the Dockerfile must COPY it alongside bot.py.
+PROMPT_TEMPLATE = (Path(__file__).parent / "prompt.md").read_text().rstrip("\n")
 # (query ran, no query ran) — appended to replies so the user knows the turn is over
 FOOTERS = {
     "ES": ("\n\n✅ Consulta finalizada — puedes hacer otra pregunta o pedir un ajuste.",
@@ -384,98 +391,6 @@ async def edit_html(status, text: str):
 
 hasher = PasswordHasher()
 
-# Known-good question -> SQL pairs; :farmId/:herdId are placeholders the model
-# must replace with the scoped UUIDs (or drop/replace joins when unscoped).
-FEW_SHOTS = """
-EXAMPLE QUERIES — follow these patterns. Replace :farmId and :herdId with the
-selected farm/herd UUIDs from context; if no herd is selected drop the lots
-join; if no farm is selected join farms and match by name with ILIKE.
-Note: "ageGroup" is camelCase and must be double-quoted; enum values are
-uppercase (sex: MALE/FEMALE; ageGroup: CALF/YEARLING/HEIFER/STEER/COW/BULL).
-
--- ¿Cuál es la búfala más vieja?
-SELECT a.physical_id, a.name, a.birth_date,
-       DATE_PART('year', AGE(a.birth_date)) AS edad_anios
-FROM animals a
-JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
-WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
-  AND a.sex = 'FEMALE' AND a."ageGroup" = 'COW' AND a.birth_date IS NOT NULL
-ORDER BY a.birth_date ASC LIMIT 1;
-
--- ¿Cuántas búfalas preñadas y vacías hay? (último examen por animal; sin examen = sin chequeo)
-SELECT COUNT(*) FILTER (WHERE ex.result = 'PREGNANT')          AS prenadas,
-       COUNT(*) FILTER (WHERE ex.result = 'NOT_PREGNANT')      AS vacias,
-       COUNT(*) FILTER (WHERE ex.result = 'POSSIBLY_PREGNANT') AS posiblemente_prenadas,
-       COUNT(*) FILTER (WHERE ex.result IS NULL)               AS sin_chequeo
-FROM animals a
-JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
-LEFT JOIN LATERAL (
-  SELECT ge.result FROM gynecological_exams ge
-  WHERE ge.animal_id = a.id AND ge.is_deleted = false
-  ORDER BY ge.date DESC LIMIT 1
-) ex ON true
-WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
-  AND a.sex = 'FEMALE' AND a."ageGroup" IN ('COW', 'HEIFER');
-
--- ¿Cuántos bautes (machos) y bautas (hembras) hay? (añojos = YEARLING)
-SELECT COUNT(*) FILTER (WHERE a.sex = 'MALE')   AS bautes,
-       COUNT(*) FILTER (WHERE a.sex = 'FEMALE') AS bautas
-FROM animals a
-JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
-WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
-  AND a."ageGroup" = 'YEARLING';
-
--- ¿Cuántas búfalas secas y en ordeño? (en ordeño = lactancia abierta: inicio sin fin)
-SELECT COUNT(*) FILTER (WHERE ol.animal_id IS NOT NULL) AS en_ordeno,
-       COUNT(*) FILTER (WHERE ol.animal_id IS NULL)     AS secas
-FROM animals a
-JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
-LEFT JOIN (
-  SELECT DISTINCT ls.animal_id
-  FROM lactation_start_events ls
-  LEFT JOIN lactation_end_events le
-    ON le.animal_id = ls.animal_id AND le.birth_event_id = ls.birth_event_id
-   AND le.is_deleted = false
-  WHERE ls.is_deleted = false AND le.animal_id IS NULL
-) ol ON ol.animal_id = a.id
-WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
-  AND a.sex = 'FEMALE' AND a."ageGroup" = 'COW';
-
--- ¿Cuántas novillas hay?
-SELECT COUNT(*)
-FROM animals a
-JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
-WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
-  AND a.sex = 'FEMALE' AND a."ageGroup" = 'HEIFER';
-
--- ¿Cuál es el peso promedio de los bautes? (último pesaje por animal)
-SELECT ROUND(AVG(lw.weight), 1) AS peso_promedio_kg,
-       COUNT(*)                 AS animales_pesados
-FROM animals a
-JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
-JOIN LATERAL (
-  SELECT we.weight FROM weigh_in_events we
-  WHERE we.animal_id = a.id AND we.is_deleted = false
-  ORDER BY we.date DESC LIMIT 1
-) lw ON true
-WHERE a.farm_id = :farmId AND a.is_deleted = false AND a.is_active = true
-  AND a.sex = 'MALE' AND a."ageGroup" = 'YEARLING';
-
--- ¿Cuántos destetes en los últimos 6 meses?
-SELECT COUNT(*)
-FROM weigh_in_events we
-JOIN animals a ON a.id = we.animal_id AND a.farm_id = :farmId AND a.is_deleted = false
-JOIN lots l ON l.id = a.lot_id AND l.herd_id = :herdId AND l.is_deleted = false
-WHERE we.type = 'WEANING' AND we.is_deleted = false
-  AND we.date >= now() - interval '6 months';
-"""
-
-GROUNDING = """Every number, date, or value in your answer must come from a query result
-in this conversation — NEVER invent, estimate, or fill in data. On a follow-up question,
-first check whether earlier query results already contain the answer; if they don't, run a
-NEW query reusing the context (same animal, farm, period). If the database cannot answer
-it at all, say so plainly instead of guessing."""
-
 RUN_SQL_TOOL = {
     "type": "function",
     "function": {
@@ -524,14 +439,25 @@ ENUMS_SQL = """
     ORDER BY t.typname, e.enumsortorder;
 """
 
-def format_schema(columns: list, fks: list, enums: list) -> dict:
-    """{table_name: one-line description}, with enum values and FK targets inlined.
+# information_schema spells types out in full; the model does not need the ceremony.
+# Unmapped types pass through unchanged, so an exotic column degrades, never vanishes.
+TYPE_ABBREV = {
+    "character varying": "str", "text": "str", "character": "str",
+    "timestamp without time zone": "ts", "timestamp with time zone": "tstz",
+    "boolean": "bool", "integer": "int", "bigint": "int", "smallint": "int",
+    "numeric": "num", "double precision": "num", "real": "num",
+    "json": "json", "jsonb": "json",
+}
 
-    e.g. Table `animals`: sex (AnimalSex: MALE|FEMALE), farm_id (text -> farms.id)
+def format_schema(columns: list, fks: list, enums: list) -> tuple:
+    """(preamble, {table_name: one-line description}), enum values and FKs inlined.
+
+    e.g. Table `animals`: sex (AnimalSex: MALE|FEMALE), farm_id (-> farms.id)
 
     ponytail: an enum's values are listed on its first use only — repeating them in
     every table that uses the type was the bulk of the prompt; the type name links
-    later columns back to that one listing."""
+    later columns back to that one listing. Same idea for columns every table shares
+    (id, created_at, is_deleted...): they go in the preamble once, not on every line."""
     labels = {}
     for row in enums:
         labels.setdefault((row["schema"], row["name"]), []).append(row["label"])
@@ -543,28 +469,53 @@ def format_schema(columns: list, fks: list, enums: list) -> dict:
     targets = {(f["tbl"], f["col"]): f"{f['ref_tbl']}.{f['ref_col']}" for f in fks
                if f["tbl"] in tables and f["ref_tbl"] in tables}
 
+    # Columns every table carries with the same plain scalar type — hoisted into one
+    # preamble line. Restricted to plain scalars on purpose: enums (values are listed
+    # on first use) and FKs (targets differ per table) must stay where they are.
+    def plain(table, name, row):
+        return (row["data_type"] not in ("USER-DEFINED", "ARRAY")
+                and (table, name) not in targets)
+
+    shared = {}
+    if len(tables) > 1:
+        for i, (table, cols) in enumerate(tables.items()):
+            here = {n: TYPE_ABBREV.get(r["data_type"], r["data_type"])
+                    for n, r in cols.items() if plain(table, n, r)}
+            shared = here if i == 0 else {n: k for n, k in shared.items() if here.get(n) == k}
+        # never hoist a table into an empty line
+        if any(not (set(cols) - set(shared)) for cols in tables.values()):
+            shared = {}
+
     out = {}
     listed = set()
     for table, cols in tables.items():
         parts = []
         for name, row in cols.items():
-            kind = row["data_type"]
-            if kind == "USER-DEFINED":
+            if name in shared:
+                continue
+            kind = TYPE_ABBREV.get(row["data_type"], row["data_type"])
+            if row["data_type"] == "USER-DEFINED":
                 key = (row["udt_schema"], row["udt_name"])
                 kind = row["udt_name"]
                 values = labels.get(key)
                 if values and key not in listed:
                     listed.add(key)
                     kind = f"{kind}: {'|'.join(values)}"
-            elif kind == "ARRAY":
+            elif row["data_type"] == "ARRAY":
                 kind = row["udt_name"].lstrip("_") + "[]"
             ref = targets.get((table, name))
-            parts.append(f"{name} ({kind}{' -> ' + ref if ref else ''})")
+            # the arrow already implies the type: it is whatever the target column is
+            parts.append(f"{name} (-> {ref})" if ref else f"{name} ({kind})")
         out[table] = f"Table `{table}`: {', '.join(parts)}"
-    return out
 
-async def get_db_schema(pool) -> dict:
-    """Fetch schema as {table_name: one-line description}. Startup only."""
+    preamble = ""
+    if shared:
+        cols = ", ".join(f"{n} ({k})" for n, k in shared.items())
+        preamble = f"Every table also has, not repeated below: {cols}\n"
+    return preamble, out
+
+async def get_db_schema(pool) -> tuple:
+    """Fetch schema as (preamble, {table_name: one-line description}). Startup only."""
     async with pool.acquire() as conn:
         columns = await conn.fetch(COLUMNS_SQL, DB_SCHEMA, SCHEMA_TABLES or None)
         fks = await conn.fetch(FKS_SQL, DB_SCHEMA)
@@ -634,49 +585,20 @@ def build_prompts(schema: str, org_id: str, scope: str, locale: str) -> tuple:
     static is byte-stable per locale so the Claude path can prompt-cache it (one cache
     entry per language); only org_id and scope vary per user, and they go in dynamic.
     The LiteLLM path concatenates both into one system message."""
-    static = f"""You are a helpful assistant for the users of a farm-management system,
-with read access to its PostgreSQL database. You hold a normal conversation and you
-answer questions from the data.
-DATABASE SCHEMA (a column shown as `x -> y.z` is a foreign key; an enum column lists
-its allowed values):
-{schema}
-Most tables are multi-tenant: a query touching them MUST filter by the current user's
-organization_id (given below), directly or via a join to a table that has it. A table
-with no organization_id and no join path to one is global reference data — query it
-directly, do not invent a scope for it.
-Rows with is_deleted = true must be excluded.
-All ids are UUIDs — NEVER guess an id from a name. When the user mentions a farm,
-herd, animal, or person by name, match it with a join and ILIKE (e.g.
-JOIN farms f ON ... WHERE f.name ILIKE '%san rafael%').
-When the question needs data, construct a valid SELECT query and use the
-'run_sql_query' tool. NEVER use destructive queries. When it doesn't need data — a
-greeting, a thank-you, asking what you can do, explaining what a field or a metric
-means, or discussing a result you already fetched — just reply in plain language, no
-tool call.
-If the question is ambiguous or missing information you need (which farm, which period,
-which animals), ask a short clarifying question instead of guessing.
-Never announce that you are going to look something up or run a query — either run it
-now with the tool, or ask your clarifying question. Your reply ends the turn.
-{GROUNDING}
-In your answer, format dates like 15/03/2024 (no timestamps unless asked), round decimals
-sensibly (e.g. 512.5 kg, ages and animal counts as whole years), and never show UUIDs.
-Format answers in simple Markdown only: **bold**, `code`, and "- " bullet lists.
-No headers, tables, links, or italics.
-{FEW_SHOTS}
-Those are examples of SQL style, not a limit on which tables or topics you can cover —
-use any table in the schema above.
-Always answer the user in {LANGUAGES.get(locale, 'English')}.
-{enum_labels_text(locale)}"""
+    static = PROMPT_TEMPLATE.format(schema=schema,
+                                    language=LANGUAGES.get(locale, "English"),
+                                    enum_labels=enum_labels_text(locale))
     dynamic = f"The current user's organization_id is '{org_id}'.{scope}"
     return static, dynamic
 
-async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str,
+async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, common: str, org_id: str,
                                 locale: str, scope: str = "", history: list = None,
                                 sw: Stopwatch = None, progress=None) -> tuple:
     """SQL generation via the Claude API. Returns (reply, last_executed_sql or None)."""
     # Static block (identical across users/turns) is prompt-cached; the
     # per-user specifics go in a second block after the cache breakpoint.
-    static_text, dynamic_text = build_prompts("\n".join(schema_map.values()), org_id, scope, locale)
+    static_text, dynamic_text = build_prompts(common + "\n".join(schema_map.values()),
+                                              org_id, scope, locale)
     system = [
         # 1h TTL: the default 5-minute cache almost never hits on a low-traffic bot
         {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
@@ -720,11 +642,15 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
                 else:
                     response = await anthropic_client.messages.create(**kwargs)
                 break
-            except (json.JSONDecodeError, anthropic.APIConnectionError) as e:
+            except (json.JSONDecodeError, anthropic.APIConnectionError, httpx.TransportError) as e:
                 # ponytail: JSONDecodeError = Moonshot returning 200 with an empty body on a
                 # slow request (the SDK won't retry a "successful" status); APIConnectionError
-                # = dropped socket, the SDK's own retries already exhausted. Back off and redo
-                # the whole call — messages/tool_results are unchanged, so it is safe to repeat.
+                # = dropped socket, the SDK's own retries already exhausted. httpx.TransportError
+                # = the stream died AFTER the headers arrived — the SDK only wraps and retries
+                # failures up to the response headers, so a mid-stream drop (Moonshot's gateway
+                # reaps a silent SSE stream at 60s) escapes it raw and only we can retry it.
+                # Back off and redo the whole call — messages/tool_results are unchanged,
+                # so it is safe to repeat.
                 # repr + __cause__: a bare "APIConnectionError" hides whether it was DNS,
                 # a refused socket or no route — the exception chain names it
                 logger.warning(f"LLM API call failed after {time.monotonic() - t0:.1f}s, "
@@ -798,16 +724,16 @@ async def pick_tables(client, headers, question: str, table_names: list) -> list
     # match known names in the reply — no fragile JSON parsing of a small model
     return [t for t in table_names if re.search(rf"\b{re.escape(t)}\b", text)]
 
-async def query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str,
-                         scope: str = "", history: list = None, sw: Stopwatch = None,
+async def query_pipeline(user_prompt: str, pool, schema_map: dict, common: str, org_id: str,
+                         locale: str, scope: str = "", history: list = None, sw: Stopwatch = None,
                          progress=None) -> tuple:
     """Dispatch to the Claude API when a key is configured, else local LiteLLM."""
     if anthropic_client:
-        return await claude_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history, sw, progress)
-    return await litellm_query_pipeline(user_prompt, pool, schema_map, org_id, locale, scope, history, sw, progress)
+        return await claude_query_pipeline(user_prompt, pool, schema_map, common, org_id, locale, scope, history, sw, progress)
+    return await litellm_query_pipeline(user_prompt, pool, schema_map, common, org_id, locale, scope, history, sw, progress)
 
-async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id: str, locale: str,
-                                 scope: str = "", history: list = None, sw: Stopwatch = None,
+async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, common: str, org_id: str,
+                                 locale: str, scope: str = "", history: list = None, sw: Stopwatch = None,
                                  progress=None) -> tuple:
     """Orchestrates routing -> LLM -> SQL (with self-correction) -> LLM.
     Returns (reply, last_executed_sql or None)."""
@@ -833,7 +759,7 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
                 # where ENUM_GLOSSARY still names the values that matter
                 logger.info(f"Routing: {len(picked)}/{len(tables)} tables: {', '.join(picked)}")
                 tables = picked
-        static_text, dynamic_text = build_prompts("\n".join(schema_map[t] for t in tables),
+        static_text, dynamic_text = build_prompts(common + "\n".join(schema_map[t] for t in tables),
                                                   org_id, scope, locale)
         system_prompt = static_text + "\n" + dynamic_text + (" /no_think" if NO_THINK else "")
 
@@ -1102,7 +1028,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         sw = Stopwatch()  # ponytail: always runs; laps are ~ns, gating only at report time
-        reply, executed_sql = await query_pipeline(prompt, pool, context.bot_data["db_schema"], org_id,
+        reply, executed_sql = await query_pipeline(prompt, pool, context.bot_data["db_schema"],
+                                                   context.bot_data["db_common"], org_id,
                                                    get_locale(context), scope,
                                                    context.user_data.get("history"), sw, progress)
         # skip the write-back if /login, /new or /logout ran while we awaited the LLM —
@@ -1157,13 +1084,14 @@ async def post_init(app):
         raise RuntimeError(f"DATABASE_URL connects as '{role}', expected '{DB_ROLE}' — "
                            "table owners bypass RLS, so this would disable tenant isolation (see rls.sql)")
     app.bot_data["db_pool"] = pool
-    schema_map = await get_db_schema(pool)
+    common, schema_map = await get_db_schema(pool)
     app.bot_data["db_schema"] = schema_map
+    app.bot_data["db_common"] = common
     # a low count means a stale rls.sql or a stray SCHEMA_TABLES, not a bad model
     logger.info(f"Schema: {len(schema_map)} tables visible in '{DB_SCHEMA}'")
     for ud in app.user_data.values():  # a crash mid-request must not persist a stuck busy flag
         ud.pop("busy", None)
-    total = sum(len(v) for v in schema_map.values())
+    total = len(common) + sum(len(v) for v in schema_map.values())
     if anthropic_client:
         name = "Claude API" if ANTHROPIC_API_KEY else "Kimi (Anthropic-compatible)"
         provider = f"{name} ({LLM_MODEL})"
