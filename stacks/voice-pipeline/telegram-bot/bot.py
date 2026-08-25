@@ -25,10 +25,13 @@ from telegram.ext import (
     filters,
 )
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()  # DEBUG adds the SDKs' own request/response tracing
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=LOG_LEVEL,
 )
+for _sdk in ("anthropic", "httpx", "httpcore"):  # they default to WARNING, so DEBUG never reaches them otherwise
+    logging.getLogger(_sdk).setLevel(LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -68,6 +71,7 @@ LLM_BACKEND = "anthropic" if ANTHROPIC_API_KEY else "kimi" if KIMI_API_KEY else 
 # One connection pool for Whisper + LiteLLM calls (per-request clients paid a TLS handshake every turn)
 http_client = httpx.AsyncClient(timeout=LLM_TIMEOUT)
 
+LOG_BODY_CHARS = 2000    # cap logged response bodies
 MAX_RESULT_CHARS = 8000  # keep SQL results from blowing up the model context
 MAX_ROWS = 1000          # cap fetched rows; a model-emitted cartesian join must not stall the bot
 TELEGRAM_MSG_LIMIT = 4096
@@ -589,6 +593,17 @@ def shrink_result(rows: list) -> str:
         result = result[:MAX_RESULT_CHARS] + " … (row truncated)"
     return result
 
+def check_resp(resp, what: str):
+    """raise_for_status(), but log the body first: httpx puts the status code in the
+    exception message and drops the body, which is where LiteLLM and Whisper put the
+    actual reason. Body at DEBUG on success, ERROR on failure."""
+    body = resp.text[:LOG_BODY_CHARS]
+    if resp.is_error:
+        logger.error(f"{what} HTTP {resp.status_code}: {body}")
+    else:
+        logger.debug(f"{what} HTTP {resp.status_code}: {body}")
+    resp.raise_for_status()
+
 async def execute_sql(pool, sql_query: str, org_id: str, sw: Stopwatch) -> tuple:
     """Run SQL read-only; RLS (see rls.sql) hides rows outside org_id.
     Returns (result_json, ok)."""
@@ -691,12 +706,21 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
                 # slow request (the SDK won't retry a "successful" status); APIConnectionError
                 # = dropped socket, the SDK's own retries already exhausted. Back off and redo
                 # the whole call — messages/tool_results are unchanged, so it is safe to repeat.
-                logger.warning(f"LLM API call failed ({type(e).__name__}), retrying ({retry + 1}/3)")
+                # repr + __cause__: a bare "APIConnectionError" hides whether it was DNS,
+                # a refused socket or no route — the exception chain names it
+                logger.warning(f"LLM API call failed, retrying ({retry + 1}/3): {e!r}"
+                               + (f" <- {e.__cause__!r}" if e.__cause__ else ""))
                 await asyncio.sleep(2 ** retry)
         else:
             sw.lap("llm")  # close the interval so the failed retries aren't booked as format
             return "The AI service is not responding — please try again.", executed_sql
         sw.lap("llm")  # retries fold into one entry
+        u = response.usage
+        # cache_r is the number that says whether the 1h prompt cache above is earning its keep
+        logger.info(f"LLM resp: stop={response.stop_reason} in={u.input_tokens} out={u.output_tokens} "
+                    f"cache_r={getattr(u, 'cache_read_input_tokens', None)} "
+                    f"cache_w={getattr(u, 'cache_creation_input_tokens', None)}")
+        logger.debug(f"LLM content: {response.content}")
 
         if response.stop_reason == "refusal":
             logger.warning("Claude declined the request (stop_reason=refusal)")
@@ -731,7 +755,7 @@ async def pick_tables(client, headers, question: str, table_names: list) -> list
                              json={"model": MODEL_NAME, "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS,
                                    "messages": [{"role": "user", "content": prompt}]},
                              headers=headers)
-    resp.raise_for_status()
+    check_resp(resp, "litellm/route")
     text = resp.json()["choices"][0]["message"]["content"] or ""
     # match known names in the reply — no fragile JSON parsing of a small model
     return [t for t in table_names if re.search(rf"\b{re.escape(t)}\b", text)]
@@ -787,7 +811,7 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
                                      json={"model": MODEL_NAME, "messages": messages, "tools": [RUN_SQL_TOOL],
                                            "tool_choice": "auto", "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS},
                                      headers=headers)
-            resp.raise_for_status()
+            check_resp(resp, "litellm/tool")
             sw.lap("llm")
             message = resp.json()["choices"][0]["message"]
             content = message.get("content") or ""
@@ -830,7 +854,7 @@ async def litellm_query_pipeline(user_prompt: str, pool, schema_map: dict, org_i
         sw.lap("bot_llm")
         final_resp = await client.post(LITELLM_URL, json={"model": MODEL_NAME, "messages": messages,
                                                           "num_ctx": NUM_CTX, "max_tokens": MAX_TOKENS}, headers=headers)
-        final_resp.raise_for_status()
+        check_resp(final_resp, "litellm/final")
         sw.lap("llm")
         return final_resp.json()["choices"][0]["message"]["content"], executed_sql
 
@@ -1011,7 +1035,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r = await http_client.post(WHISPER_URL, files={"file": ("voice.ogg", bytes(voice_bytes))}, data={"model": "whisper-1"},
                                        headers={"Authorization": f"Bearer {WHISPER_API_KEY}"} if WHISPER_API_KEY else {},
                                        timeout=120.0)
-            r.raise_for_status()
+            check_resp(r, "whisper")
             prompt = r.json().get("text", "").strip()
             if not prompt:
                 await status.edit_text(t(context, "transcribe_failed"))
@@ -1052,6 +1076,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if DEBUG_MODE and executed_sql:
             reply = f"{reply or ''}\n\n🔧 SQL:\n```sql\n{executed_sql}\n```"
         footer = FOOTERS[get_locale(context)][0 if executed_sql else 1]
+        logger.info(f"A: {(reply or '')[:200]}")
         await edit_html(status, echo + (reply or "No response generated.") + footer)
         sw.lap("format")
         if DEBUG_MODE:
