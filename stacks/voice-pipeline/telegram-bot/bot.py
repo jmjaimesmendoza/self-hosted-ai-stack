@@ -53,6 +53,8 @@ LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))  # cold model load can take
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))  # cap runaway generation (ollama default is unlimited)
 # qwen3 soft switch: skip multi-minute <think> spirals; harmless noise for other models
 NO_THINK = os.getenv("NO_THINK", "true").lower() == "true"
+# stream the Anthropic/Kimi call: a silent socket for a whole long generation gets dropped
+LLM_STREAM = os.getenv("LLM_STREAM", "true").lower() == "true"
 # Claude API path: enabled when a key is present; otherwise the LiteLLM path runs
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5")
@@ -704,10 +706,19 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
                 logger.info(f"LLM call: {LLM_MODEL} attempt={retry + 1}/3 msgs={len(messages)} "
                             f"sys={sum(len(b['text']) for b in system)}c "
                             f"tools={kwargs.get('tool_choice', {}).get('type', 'auto')} "
-                            f"timeout={LLM_TIMEOUT}s x{anthropic_client.max_retries + 1} sdk tries")
+                            f"timeout={LLM_TIMEOUT}s x{anthropic_client.max_retries + 1} sdk tries "
+                            f"stream={LLM_STREAM}")
                 logger.debug(f"LLM request: {json.dumps(kwargs, default=str)[:LOG_BODY_CHARS]}")
                 t0 = time.monotonic()
-                response = await anthropic_client.messages.create(**kwargs)
+                if LLM_STREAM:
+                    # a non-streaming call leaves the socket silent for the whole generation —
+                    # minutes with Kimi's thinking blocks — and Moonshot reaps it as idle.
+                    # SSE events keep bytes flowing; get_final_message() returns the same Message.
+                    # ponytail: LLM_STREAM=false reverts if a provider can't do SSE
+                    async with anthropic_client.messages.stream(**kwargs) as stream:
+                        response = await stream.get_final_message()
+                else:
+                    response = await anthropic_client.messages.create(**kwargs)
                 break
             except (json.JSONDecodeError, anthropic.APIConnectionError) as e:
                 # ponytail: JSONDecodeError = Moonshot returning 200 with an empty body on a
@@ -742,7 +753,11 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
                 logger.info(f"LLM text: {b.text[:LOG_BODY_CHARS]}")
             elif b.type == "tool_use":
                 logger.info(f"LLM tool_use: {b.name} {json.dumps(b.input, default=str)[:LOG_BODY_CHARS]}")
-            else:
+            elif b.type == "thinking":
+                # Kimi K3 reasons here before picking a table — the only place a wrong
+                # table choice is visible before the SQL is already written
+                logger.info(f"LLM thinking: {b.thinking[:LOG_BODY_CHARS]}")
+            else:  # redacted_thinking and anything the SDK adds later
                 logger.info(f"LLM block: {b.type}")
 
         if response.stop_reason == "refusal":

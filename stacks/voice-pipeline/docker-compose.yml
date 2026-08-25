@@ -124,6 +124,7 @@ services:
       - LLM_TIMEOUT=${LLM_TIMEOUT:-300}
       - MAX_TOKENS=${MAX_TOKENS:-2000}
       - NO_THINK=${NO_THINK:-true}
+      - LLM_STREAM=${LLM_STREAM:-true}  # false = non-streaming (only if a provider lacks SSE)
       - KIMI_BASE_URL=${KIMI_BASE_URL:-https://api.moonshot.ai/anthropic}
     volumes:
       - telegram-bot-data:/data
