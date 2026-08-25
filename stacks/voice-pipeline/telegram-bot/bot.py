@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import html
 import json
@@ -677,13 +678,16 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
             try:
                 response = await anthropic_client.messages.create(**kwargs)
                 break
-            except json.JSONDecodeError:
-                # ponytail: Moonshot's endpoint sometimes returns 200 with an empty
-                # body on slow requests — the SDK won't retry a "successful" status
-                logger.warning(f"Non-JSON body from LLM API, retrying ({retry + 1}/3)")
+            except (json.JSONDecodeError, anthropic.APIConnectionError) as e:
+                # ponytail: JSONDecodeError = Moonshot returning 200 with an empty body on a
+                # slow request (the SDK won't retry a "successful" status); APIConnectionError
+                # = dropped socket, the SDK's own retries already exhausted. Back off and redo
+                # the whole call — messages/tool_results are unchanged, so it is safe to repeat.
+                logger.warning(f"LLM API call failed ({type(e).__name__}), retrying ({retry + 1}/3)")
+                await asyncio.sleep(2 ** retry)
         else:
             sw.lap("llm")  # close the interval so the failed retries aren't booked as format
-            return "The AI service returned an empty response — please try again.", executed_sql
+            return "The AI service is not responding — please try again.", executed_sql
         sw.lap("llm")  # retries fold into one entry
 
         if response.stop_reason == "refusal":
