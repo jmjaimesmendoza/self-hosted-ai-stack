@@ -699,6 +699,14 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
         sw.lap("bot_llm")
         for retry in range(3):
             try:
+                # logged before the await: a hung call is otherwise indistinguishable from
+                # a bot doing nothing — this line is the last thing you see when it stalls
+                logger.info(f"LLM call: {LLM_MODEL} attempt={retry + 1}/3 msgs={len(messages)} "
+                            f"sys={sum(len(b['text']) for b in system)}c "
+                            f"tools={kwargs.get('tool_choice', {}).get('type', 'auto')} "
+                            f"timeout={LLM_TIMEOUT}s x{anthropic_client.max_retries + 1} sdk tries")
+                logger.debug(f"LLM request: {json.dumps(kwargs, default=str)[:LOG_BODY_CHARS]}")
+                t0 = time.monotonic()
                 response = await anthropic_client.messages.create(**kwargs)
                 break
             except (json.JSONDecodeError, anthropic.APIConnectionError) as e:
@@ -708,9 +716,17 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
                 # the whole call — messages/tool_results are unchanged, so it is safe to repeat.
                 # repr + __cause__: a bare "APIConnectionError" hides whether it was DNS,
                 # a refused socket or no route — the exception chain names it
-                logger.warning(f"LLM API call failed, retrying ({retry + 1}/3): {e!r}"
+                logger.warning(f"LLM API call failed after {time.monotonic() - t0:.1f}s, "
+                               f"retrying ({retry + 1}/3): {e!r}"
                                + (f" <- {e.__cause__!r}" if e.__cause__ else ""))
                 await asyncio.sleep(2 ** retry)
+            except anthropic.APIStatusError as e:
+                # not retried here (the SDK already retried 429/5xx); logged then re-raised so
+                # the status, request id and body survive — "Handler Error" alone showed none
+                logger.error(f"LLM HTTP {e.status_code} req={getattr(e, 'request_id', None)} "
+                             f"after {time.monotonic() - t0:.1f}s: "
+                             f"{str(getattr(e, 'body', None))[:LOG_BODY_CHARS]}")
+                raise
         else:
             sw.lap("llm")  # close the interval so the failed retries aren't booked as format
             return "The AI service is not responding — please try again.", executed_sql
@@ -719,8 +735,15 @@ async def claude_query_pipeline(user_prompt: str, pool, schema_map: dict, org_id
         # cache_r is the number that says whether the 1h prompt cache above is earning its keep
         logger.info(f"LLM resp: stop={response.stop_reason} in={u.input_tokens} out={u.output_tokens} "
                     f"cache_r={getattr(u, 'cache_read_input_tokens', None)} "
-                    f"cache_w={getattr(u, 'cache_creation_input_tokens', None)}")
-        logger.debug(f"LLM content: {response.content}")
+                    f"cache_w={getattr(u, 'cache_creation_input_tokens', None)} "
+                    f"req={getattr(response, '_request_id', None)} in {time.monotonic() - t0:.1f}s")
+        for b in response.content:  # the SDK logs request bodies at DEBUG but never responses
+            if b.type == "text":
+                logger.info(f"LLM text: {b.text[:LOG_BODY_CHARS]}")
+            elif b.type == "tool_use":
+                logger.info(f"LLM tool_use: {b.name} {json.dumps(b.input, default=str)[:LOG_BODY_CHARS]}")
+            else:
+                logger.info(f"LLM block: {b.type}")
 
         if response.stop_reason == "refusal":
             logger.warning("Claude declined the request (stop_reason=refusal)")
